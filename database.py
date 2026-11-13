@@ -127,10 +127,11 @@ class DatabaseManager:
                 )
 
         for channel_id, lang in channels.items():
+            is_rom = 1 if lang.lower() == "hi" else 0
             await self._conn.execute("""
                 INSERT OR IGNORE INTO group_channels (channel_id, group_id, language_code, is_romanized)
-                VALUES (?, ?, ?, 0);
-            """, (channel_id, "default", lang))
+                VALUES (?, ?, ?, ?);
+            """, (channel_id, "default", lang, is_rom))
 
         await self._conn.commit()
 

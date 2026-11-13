@@ -46,10 +46,19 @@ MAX_DISCORD_MESSAGE_LENGTH = 2000
 MAX_LRU_CACHE_SIZE = 1000
 MAX_CONCURRENT_RELAYS = 5
 
+# Default channel IDs if not configured in environment variables (for cloud deployment)
+DEFAULT_CHANNELS: Dict[int, str] = {
+    1570749033717436446: "en",
+    1570749049970102284: "es",
+    1570749076151078992: "ja",
+    1570749098976616529: "hi",
+}
+
 def load_channel_mappings() -> Dict[int, str]:
     """
     Parses environment variables and returns active channel mappings.
     Only channels with a valid integer ID > 0 are included.
+    Falls back to DEFAULT_CHANNELS if no environment variables are set.
     """
     mappings: Dict[int, str] = {}
     for lang, env_var in LANGUAGE_CONFIG_KEYS.items():
@@ -60,6 +69,7 @@ def load_channel_mappings() -> Dict[int, str]:
                 mappings[channel_id] = lang
         except ValueError:
             continue
-    return mappings
+
+    return mappings if mappings else dict(DEFAULT_CHANNELS)
 
 CHANNELS = load_channel_mappings()
