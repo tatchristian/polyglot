@@ -20,11 +20,26 @@ relay_manager = WebhookRelayManager(bot, translator_service, db_manager)
 start_time = time.time()
 
 SUPPORTED_LANGUAGES = [
+    app_commands.Choice(name="Korean (ko)", value="ko"),
+    app_commands.Choice(name="Japanese (ja)", value="ja"),
     app_commands.Choice(name="Hindi (hi)", value="hi"),
     app_commands.Choice(name="Spanish (es)", value="es"),
     app_commands.Choice(name="English (en)", value="en"),
-    app_commands.Choice(name="Japanese (ja)", value="ja"),
+    app_commands.Choice(name="French (fr)", value="fr"),
     app_commands.Choice(name="German (de)", value="de"),
+    app_commands.Choice(name="Portuguese (pt)", value="pt"),
+    app_commands.Choice(name="Chinese Simplified (zh)", value="zh"),
+    app_commands.Choice(name="Russian (ru)", value="ru"),
+    app_commands.Choice(name="Italian (it)", value="it"),
+    app_commands.Choice(name="Arabic (ar)", value="ar"),
+    app_commands.Choice(name="Indonesian (id)", value="id"),
+    app_commands.Choice(name="Vietnamese (vi)", value="vi"),
+    app_commands.Choice(name="Thai (th)", value="th"),
+    app_commands.Choice(name="Tagalog / Filipino (tl)", value="tl"),
+    app_commands.Choice(name="Turkish (tr)", value="tr"),
+    app_commands.Choice(name="Polish (pl)", value="pl"),
+    app_commands.Choice(name="Dutch (nl)", value="nl"),
+    app_commands.Choice(name="Ukrainian (uk)", value="uk"),
 ]
 
 @bot.event

@@ -96,6 +96,21 @@ MYMEMORY_LANG_MAP = {
     "ja": "japanese",
     "hi": "hindi",
     "de": "german",
+    "ko": "korean",
+    "fr": "french",
+    "pt": "portuguese",
+    "ru": "russian",
+    "it": "italian",
+    "zh": "chinese simplified",
+    "ar": "arabic",
+    "id": "indonesian",
+    "vi": "vietnamese",
+    "th": "thai",
+    "tl": "tagalog",
+    "tr": "turkish",
+    "pl": "polish",
+    "nl": "dutch",
+    "uk": "ukrainian",
 }
 
 class TranslationService:
