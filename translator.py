@@ -1,7 +1,9 @@
 """Translation service with cascading multi-provider failover, syntax shielding, and chunking."""
 
 import re
+import time
 import asyncio
+import threading
 from collections import OrderedDict
 from typing import List, Tuple, Dict, Optional, Callable
 from deep_translator import (
@@ -10,6 +12,7 @@ from deep_translator import (
     DeeplTranslator,
     MicrosoftTranslator,
 )
+from deep_translator.exceptions import TooManyRequests
 from config import (
     MAX_DISCORD_MESSAGE_LENGTH,
     DEEPL_API_KEY,
@@ -127,7 +130,8 @@ MYMEMORY_LANG_MAP = {
 UNIVERSAL_TOKENS = {
     "lol", "lmao", "rofl", "gg", "ggwp", "w", "l", "f", "idk", "afk", "brb",
     "npc", "ping", "lag", "dc", "vc", "ok", "k", "ty", "thx", "pls", "plz",
-    "rip", "wip", "bruh", "xd", "ez", "glhf", "mb", "omg", "wtf"
+    "rip", "wip", "bruh", "xd", "ez", "glhf", "mb", "omg", "wtf",
+    "yes", "yeah", "yep", "no", "nah"
 }
 
 def is_passthrough_text(text: str) -> bool:
@@ -146,22 +150,81 @@ def is_passthrough_text(text: str) -> bool:
         return True
 
     # 3. Pure numbers, punctuation, or unicode symbols/emojis
-    if not re.search(r"[a-zA-Z\u00C0-\u024F\u0400-\u04FF\u0600-\u06FF\u0900-\u097F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF]", cleaned):
+    # Includes Latin, Cyrillic, Arabic, Devanagari (Hindi), Thai (\u0E00-\u0E7F), Japanese, CJK, Hangul
+    if not re.search(r"[a-zA-Z\u00C0-\u024F\u0400-\u04FF\u0600-\u06FF\u0900-\u097F\u0E00-\u0E7F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF]", cleaned):
         return True
 
     # 4. Universal single-word gaming/internet tokens
-    if cleaned.lower() in UNIVERSAL_TOKENS:
+    lowered = cleaned.lower()
+    if lowered in UNIVERSAL_TOKENS:
+        return True
+    # Collapse repeated consecutive characters (e.g. loool -> lol, yessss -> yes, okk -> ok)
+    collapsed = re.sub(r'(.)\1{2,}', r'\1', lowered)
+    if collapsed in UNIVERSAL_TOKENS:
+        return True
+    collapsed_pairs = re.sub(r'(.)\1+', r'\1', lowered)
+    if collapsed_pairs in UNIVERSAL_TOKENS:
         return True
 
     return False
 
-class TranslationService:
-    """Manages translation with automatic multi-provider fallback, LRU caching, and LLM failover."""
+class CircuitState:
+    HEALTHY = "HEALTHY"
+    COOLDOWN = "COOLDOWN"
 
-    def __init__(self, llm_service=None, cache_size: int = 2000):
+class CircuitBreaker:
+    """Tracks provider health and cooldown periods when rate-limited."""
+
+    def __init__(self, cooldown_duration: float = 60.0):
+        self.cooldown_duration = cooldown_duration
+        self.cooldown_until: float = 0.0
+        self.failover_count: int = 0
+
+    @property
+    def state(self) -> str:
+        if time.time() < self.cooldown_until:
+            return CircuitState.COOLDOWN
+        return CircuitState.HEALTHY
+
+    @property
+    def is_healthy(self) -> bool:
+        return self.state == CircuitState.HEALTHY
+
+    def mark_cooldown(self, duration: Optional[float] = None):
+        dur = duration if duration is not None else self.cooldown_duration
+        self.cooldown_until = time.time() + dur
+        self.failover_count += 1
+
+    def reset(self):
+        self.cooldown_until = 0.0
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """Checks whether an exception indicates a 429 or rate limit."""
+    if isinstance(e, TooManyRequests):
+        return True
+    msg = str(e).lower()
+    return (
+        "429" in msg or
+        "too many requests" in msg or
+        "toomanyrequests" in msg or
+        "rate limit" in msg or
+        getattr(e, "status_code", None) == 429
+    )
+
+class TranslationService:
+    """Manages translation with cascading multi-provider fallback, circuit breakers, LRU & SQLite caching, and LLM failover."""
+
+    def __init__(self, llm_service=None, db=None, cache_size: int = 2000):
         self.llm_service = llm_service
+        self.db = db
         self.cache_size = cache_size
         self._cache: OrderedDict[Tuple[str, str, str], str] = OrderedDict()
+        self._rr_index = 0
+        self._lock = threading.Lock()
+        self.circuit_breakers: Dict[str, CircuitBreaker] = {
+            name: CircuitBreaker(60.0)
+            for name in ["deepl", "azure", "mymemory", "google", "groq_llm"]
+        }
         self.stats = {
             "total_translated": 0,
             "cache_hits": 0,
@@ -171,6 +234,8 @@ class TranslationService:
             "google_success": 0,
             "llm_success": 0,
             "errors": 0,
+            "failovers": 0,
+            "circuit_breaker_cooldowns": 0,
         }
 
     def _get_from_cache(self, source_lang: str, target_lang: str, text: str) -> Optional[str]:
@@ -183,20 +248,29 @@ class TranslationService:
 
     def _save_to_cache(self, source_lang: str, target_lang: str, text: str, translated: str):
         """Stores translated phrase in bounded LRU memory."""
-        if not translated or not text or "*(All providers exhausted" in translated:
+        if not translated or not text or "*(All providers exhausted" in translated or "*(Translation runtime error" in translated:
             return
         key = (source_lang, target_lang, text.strip().lower())
         self._cache[key] = translated
         if len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
 
-    def _get_providers(self, source_lang: str, target_lang: str) -> List[Tuple[str, Callable[[str], str]]]:
-        """Returns the ordered list of active translation providers."""
-        providers = []
+    async def _save_translation(self, source_lang: str, target_lang: str, text: str, translated: str):
+        """Stores translated phrase in both L1 RAM cache and L2 SQLite cache."""
+        self._save_to_cache(source_lang, target_lang, text, translated)
+        if self.db:
+            try:
+                await self.db.set_cached_translation(source_lang, target_lang, text, translated)
+            except Exception as e:
+                print(f"L2 cache save error: {e}")
+
+    def _get_providers(self, source_lang: str, target_lang: str, rotate: bool = True) -> List[Tuple[str, Callable[[str], str]]]:
+        """Returns active translation providers, skipping cooldowns and rotating starting provider."""
+        all_providers: List[Tuple[str, Callable[[str], str]]] = []
 
         # 1. DeepL Free API (if key provided)
         if DEEPL_API_KEY:
-            providers.append((
+            all_providers.append((
                 "deepl",
                 lambda t: DeeplTranslator(
                     api_key=DEEPL_API_KEY,
@@ -208,7 +282,7 @@ class TranslationService:
 
         # 2. Azure Microsoft Translator (if key provided)
         if AZURE_TRANSLATOR_KEY:
-            providers.append((
+            all_providers.append((
                 "azure",
                 lambda t: MicrosoftTranslator(
                     api_key=AZURE_TRANSLATOR_KEY,
@@ -221,7 +295,7 @@ class TranslationService:
         # 3. MyMemory API (zero-key free tier, 50k words/day with email)
         mm_src = MYMEMORY_LANG_MAP.get(source_lang, source_lang)
         mm_target = MYMEMORY_LANG_MAP.get(target_lang, target_lang)
-        providers.append((
+        all_providers.append((
             "mymemory",
             lambda t: MyMemoryTranslator(
                 source=mm_src,
@@ -231,7 +305,7 @@ class TranslationService:
         ))
 
         # 4. Google Translate (free scraping fallback)
-        providers.append((
+        all_providers.append((
             "google",
             lambda t: GoogleTranslator(
                 source=source_lang,
@@ -239,7 +313,15 @@ class TranslationService:
             ).translate(t)
         ))
 
-        return providers
+        # Filter out providers currently in cooldown
+        healthy = [p for p in all_providers if self.circuit_breakers.get(p[0], CircuitBreaker()).is_healthy]
+        if not healthy or not rotate:
+            return healthy
+
+        with self._lock:
+            start_idx = self._rr_index % len(healthy)
+            self._rr_index += 1
+            return healthy[start_idx:] + healthy[:start_idx]
 
     def _sync_translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """Translates text cascading through providers until one succeeds."""
@@ -248,6 +330,10 @@ class TranslationService:
 
         shielded_text, token_map = shield_syntax(text)
         providers = self._get_providers(source_lang, target_lang)
+
+        if not providers:
+            self.stats["errors"] += 1
+            return f"*(All providers exhausted: RateLimitCooldown)* {text}"
 
         last_error = None
         for name, translate_fn in providers:
@@ -259,7 +345,12 @@ class TranslationService:
                     return restore_syntax(translated, token_map)
             except Exception as e:
                 last_error = e
-                # Provider failed or rate-limited; cascade to next provider
+                # Provider failed or rate-limited; trigger circuit breaker on 429
+                if _is_rate_limit_error(e):
+                    if name in self.circuit_breakers:
+                        self.circuit_breakers[name].mark_cooldown(60.0)
+                    self.stats["failovers"] += 1
+                    self.stats["circuit_breaker_cooldowns"] += 1
                 continue
 
         self.stats["errors"] += 1
@@ -272,7 +363,7 @@ class TranslationService:
         source_lang: str,
         target_lang: str
     ) -> List[str]:
-        """Translates text asynchronously with passthrough filtering, LRU caching, and cascading LLM failover."""
+        """Translates text asynchronously with passthrough filtering, two-tier caching, and cascading LLM failover."""
         if not text or not text.strip():
             return []
 
@@ -289,6 +380,19 @@ class TranslationService:
             self.stats["cache_hits"] += 1
             self.stats["total_translated"] += 1
             return chunk_message(cached)
+
+        # 3. L2 SQLite Cache Check: Persistent across bot restarts
+        if self.db:
+            try:
+                l2_cached = await self.db.get_cached_translation(source_lang, target_lang, text)
+                if l2_cached:
+                    self.stats["cache_hits"] += 1
+                    self.stats["total_translated"] += 1
+                    # Backfill L1 RAM
+                    self._save_to_cache(source_lang, target_lang, text, l2_cached)
+                    return chunk_message(l2_cached)
+            except Exception as e:
+                print(f"L2 cache lookup error: {e}")
 
         translated_text = None
         try:
@@ -309,27 +413,32 @@ class TranslationService:
         )
 
         if failed_traditional and self.llm_service:
-            # Shield text before passing to LLM to preserve Discord mentions and emojis
-            shielded_text, token_map = shield_syntax(text)
-            try:
-                llm_result = await self.llm_service.translate_general(
-                    text=shielded_text,
-                    source_lang=source_lang,
-                    target_lang=target_lang
-                )
-                if llm_result:
-                    restored = restore_syntax(llm_result, token_map)
-                    self.stats["llm_success"] += 1
-                    self.stats["total_translated"] += 1
-                    self._save_to_cache(source_lang, target_lang, text, restored)
-                    return chunk_message(restored)
-            except Exception as e:
-                print(f"LLM translation fallback error: {e}")
+            if self.circuit_breakers.get("groq_llm", CircuitBreaker()).is_healthy:
+                # Shield text before passing to LLM to preserve Discord mentions and emojis
+                shielded_text, token_map = shield_syntax(text)
+                try:
+                    llm_result = await self.llm_service.translate_general(
+                        text=shielded_text,
+                        source_lang=source_lang,
+                        target_lang=target_lang
+                    )
+                    if llm_result:
+                        restored = restore_syntax(llm_result, token_map)
+                        self.stats["llm_success"] += 1
+                        self.stats["total_translated"] += 1
+                        await self._save_translation(source_lang, target_lang, text, restored)
+                        return chunk_message(restored)
+                except Exception as e:
+                    print(f"LLM translation fallback error: {e}")
+                    if _is_rate_limit_error(e):
+                        self.circuit_breakers["groq_llm"].mark_cooldown(60.0)
+                        self.stats["failovers"] += 1
+                        self.stats["circuit_breaker_cooldowns"] += 1
 
         if not translated_text:
             translated_text = text
         elif not failed_traditional:
-            # Save successful traditional translation to cache
-            self._save_to_cache(source_lang, target_lang, text, translated_text)
+            # Save successful traditional translation to cache (L1 + L2)
+            await self._save_translation(source_lang, target_lang, text, translated_text)
 
         return chunk_message(translated_text)

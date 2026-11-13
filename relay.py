@@ -9,9 +9,9 @@ from config import (
     COMMAND_PREFIXES,
     MAX_CONCURRENT_RELAYS,
 )
-from translator import TranslationService, shield_syntax, restore_syntax
+from translator import TranslationService, shield_syntax, restore_syntax, is_passthrough_text
 from database import DatabaseManager
-from hinglish_gatekeeper import is_potential_hinglish
+from hinglish_gatekeeper import is_potential_hinglish, is_already_english
 from hinglish_normalizer import HinglishNormalizer
 
 class LRUMessageMap:
@@ -47,6 +47,8 @@ class WebhookRelayManager:
         self.bot = bot
         self.translator = translator
         self.db = db
+        if getattr(self.translator, "db", None) is None:
+            self.translator.db = self.db
         self.normalizer = HinglishNormalizer()
         self.translator.llm_service = self.normalizer
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_RELAYS)
@@ -83,10 +85,15 @@ class WebhookRelayManager:
             return False
 
         content = message.content.strip()
+        # Privacy / Opt-out prefixes: '//' or '/*' allow users to chat locally without cross-channel relay
+        if content.startswith("//") or content.startswith("/*"):
+            return False
+
         if content and any(content.startswith(p) for p in COMMAND_PREFIXES):
             return False
 
-        if not content and not message.attachments:
+        has_forward = hasattr(message, "message_snapshots") and bool(message.message_snapshots)
+        if not content and not message.attachments and not has_forward:
             return False
 
         return True
@@ -226,10 +233,28 @@ class WebhookRelayManager:
             attachment_text = "\n" + "\n".join(urls)
 
         text_to_translate = message.content.strip()
+        # If user forwarded a message via Discord's Forward feature, extract forwarded text
+        if hasattr(message, "message_snapshots") and message.message_snapshots:
+            forwarded_texts = [
+                s.content for s in message.message_snapshots if getattr(s, "content", None)
+            ]
+            if forwarded_texts:
+                forwarded_combined = "\n".join(forwarded_texts)
+                if text_to_translate:
+                    text_to_translate = f"{text_to_translate}\n*(Forwarded)* {forwarded_combined}"
+                else:
+                    text_to_translate = f"*(Forwarded)* {forwarded_combined}"
+
         normalized_english = None
 
         # Check Romanized Flag or Heuristic Gatekeeper
         should_use_ai = is_romanized_channel or is_potential_hinglish(text_to_translate, source_lang)
+        if is_passthrough_text(text_to_translate):
+            should_use_ai = False
+        elif is_romanized_channel and is_already_english(text_to_translate):
+            # Already English in a Romanized channel: zero-token direct bypass!
+            should_use_ai = False
+            normalized_english = text_to_translate
         if text_to_translate and should_use_ai:
             self.normalizer.stats["hinglish_detections"] += 1
             parent_context = None
@@ -263,8 +288,10 @@ class WebhookRelayManager:
             target_lang = dest_info["lang"]
 
             if text_to_translate:
+                if is_passthrough_text(text_to_translate):
+                    chunks = [text_to_translate]
                 # If target channel is configured as Romanized Hindi, deliver conversational Hinglish
-                if target_lang == "hi" and dest_info.get("is_romanized", False):
+                elif target_lang == "hi" and dest_info.get("is_romanized", False):
                     base_english = normalized_english
                     if not base_english:
                         en_chunks = await self.translator.translate(

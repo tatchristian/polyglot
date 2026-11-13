@@ -41,3 +41,54 @@ def is_potential_hinglish(text: str, source_lang: str = "en") -> bool:
         return True
 
     return False
+
+# Common English structure words for zero-token bypass
+COMMON_ENGLISH_WORDS: Set[str] = {
+    "the", "be", "to", "of", "and", "a", "in", "that", "have", "i",
+    "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
+    "this", "but", "his", "by", "from", "they", "we", "say", "her",
+    "she", "or", "an", "will", "my", "one", "all", "would", "there",
+    "their", "what", "so", "up", "out", "if", "about", "who", "get",
+    "which", "go", "when", "make", "can", "like", "time", "no",
+    "just", "him", "know", "take", "people", "into", "year", "your",
+    "good", "some", "could", "them", "see", "other", "than", "then",
+    "now", "look", "only", "come", "its", "over", "think", "also",
+    "back", "after", "use", "two", "how", "our", "work", "first",
+    "well", "way", "even", "new", "want", "because", "any", "these",
+    "give", "day", "most", "are", "is", "was", "were", "been", "playing",
+    "game", "play", "night", "morning", "server", "bot", "ping", "help"
+}
+
+def is_already_english(text: str) -> bool:
+    """
+    Checks if a message in a romanized channel is already standard English.
+    Returns True ONLY if:
+    1. Contains zero Devanagari Hindi characters (\u0900-\u097F).
+    2. Contains zero Hinglish keywords (is_potential_hinglish is False).
+    3. Contains common English structural words.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        return True
+
+    # 1. Any Devanagari character means it's Hindi, NOT English
+    if re.search(r"[\u0900-\u097F]", cleaned):
+        return False
+
+    # 2. Any Hinglish keyword means it should be processed by AI
+    if is_potential_hinglish(cleaned):
+        return False
+
+    # 3. Check for English word presence
+    words = re.findall(r"\b[a-zA-Z]+\b", cleaned.lower())
+    if not words:
+        return False
+
+    # Count how many words are recognized common English words
+    english_matches = sum(1 for w in words if w in COMMON_ENGLISH_WORDS)
+
+    # If the message has multiple words and at least 40% are recognized English words, it's English
+    if len(words) >= 2 and (english_matches / len(words)) >= 0.4:
+        return True
+
+    return False

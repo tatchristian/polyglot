@@ -85,3 +85,19 @@ async def test_multi_model_failover_success():
     assert result == "Success from model 2"
     assert normalizer.stats["model_failovers"] == 1
     assert normalizer.stats["groq_normalizations"] == 1
+
+def test_is_already_english_detection():
+    from hinglish_gatekeeper import is_already_english
+
+    # Pure English sentences in #hindi channel should bypass Groq
+    assert is_already_english("I am going to sleep now") is True
+    assert is_already_english("who wants to play valorant tonight?") is True
+    assert is_already_english("the server ping is very high") is True
+    assert is_already_english("can someone help me with this problem?") is True
+
+    # Real Hinglish or Hindi sentences MUST NOT bypass Groq!
+    assert is_already_english("bhai kya haal chaal") is False
+    assert is_already_english("kya scene hai") is False
+    assert is_already_english("aaja vc") is False
+    assert is_already_english("us mat par so jao") is False
+    assert is_already_english("यह क्या है") is False

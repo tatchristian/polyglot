@@ -38,6 +38,17 @@ class DatabaseManager:
         """)
 
         await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS translation_cache (
+                source_lang TEXT NOT NULL,
+                target_lang TEXT NOT NULL,
+                source_text TEXT NOT NULL,
+                translated_text TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (source_lang, target_lang, source_text)
+            );
+        """)
+
+        await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS group_channels (
                 channel_id INTEGER PRIMARY KEY,
                 group_id TEXT NOT NULL,
@@ -197,3 +208,135 @@ class DatabaseManager:
             "total_synced_messages": total_conversations,
             "configured_channels": total_channels,
         }
+
+    async def get_cached_translation(
+        self,
+        source_lang: str,
+        target_lang: str,
+        text: str
+    ) -> Optional[str]:
+        """Retrieves a cached translation from L2 SQLite cache."""
+        if not self._conn:
+            return None
+        clean_text = text.strip().lower()
+        async with self._conn.execute("""
+            SELECT translated_text FROM translation_cache
+            WHERE source_lang = ? AND target_lang = ? AND source_text = ?;
+        """, (source_lang.lower(), target_lang.lower(), clean_text)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+    async def set_cached_translation(
+        self,
+        source_lang: str,
+        target_lang: str,
+        text: str,
+        translated: str
+    ):
+        """Stores a translation in L2 SQLite cache."""
+        if not self._conn:
+            return
+        if not translated or not text or "*(All providers exhausted" in translated or "*(Translation runtime error" in translated:
+            return
+        clean_text = text.strip().lower()
+        await self._conn.execute("""
+            INSERT OR REPLACE INTO translation_cache
+            (source_lang, target_lang, source_text, translated_text)
+            VALUES (?, ?, ?, ?);
+        """, (source_lang.lower(), target_lang.lower(), clean_text, translated))
+        await self._conn.commit()
+
+    async def get_source_message_info(self, message_id: int) -> Optional[Tuple[int, int]]:
+        """Returns (source_channel_id, source_message_id) for any message ID (source or relayed)."""
+        if not self._conn:
+            return None
+        async with self._conn.execute("""
+            SELECT source_channel_id, source_message_id FROM message_sync
+            WHERE source_message_id = ? OR relayed_message_id = ?
+            LIMIT 1;
+        """, (message_id, message_id)) as cursor:
+            row = await cursor.fetchone()
+            return (row[0], row[1]) if row else None
+
+    async def prune_old_sync_records(self, days: int = 60) -> int:
+        """Deletes sync records older than given number of days to keep database lean."""
+        if not self._conn:
+            return 0
+        async with self._conn.execute("""
+            DELETE FROM message_sync 
+            WHERE created_at < datetime('now', '-' || ? || ' days');
+        """, (days,)) as cursor:
+            await self._conn.commit()
+            return cursor.rowcount
+
+    async def seed_common_translations(self):
+        """Pre-seeds L2 cache with high-frequency verified Discord chat and gaming phrases."""
+        if not self._conn:
+            return
+
+        common_pairs = [
+            # Hinglish (hi) -> English (en)
+            ("hi", "en", "kya scene hai", "What's the plan?"),
+            ("hi", "en", "kya scene hai?", "What's the plan?"),
+            ("hi", "en", "kya haal hai", "How are you doing?"),
+            ("hi", "en", "kya haal hai?", "How are you doing?"),
+            ("hi", "en", "aaja vc", "Hop in VC"),
+            ("hi", "en", "ruk 2 min", "Wait 2 mins"),
+            ("hi", "en", "theek hai", "Alright"),
+            ("hi", "en", "thik hai", "Alright"),
+            ("hi", "en", "kuch nahi", "Nothing much"),
+            ("hi", "en", "haan bhai", "Yeah bro"),
+            ("hi", "en", "sahi hai", "Sounds good"),
+            ("hi", "en", "badhiya", "Awesome"),
+            ("hi", "en", "khelna hai kya", "Anyone down to play?"),
+            ("hi", "en", "khelna hai kya?", "Anyone down to play?"),
+            ("hi", "en", "shuru ho gaya fir se", "Here we go again"),
+            ("hi", "en", "dekhne me galat lagta hai", "It looks wrong"),
+            ("hi", "en", "lagta hai bug hai", "Looks like there's a bug"),
+            ("hi", "en", "kal milte hai", "See you tomorrow"),
+            ("hi", "en", "shukriya bhai", "Thanks bro"),
+            ("hi", "en", "alvida", "Goodbye"),
+            ("hi", "en", "samajh gaya", "Got it"),
+
+            # English (en) -> Hinglish (hi)
+            ("en", "hi", "what's the plan?", "kya scene hai?"),
+            ("en", "hi", "how are you?", "kya haal hai?"),
+            ("en", "hi", "let's play", "chalo khelte hai"),
+            ("en", "hi", "hop in vc", "aaja vc"),
+            ("en", "hi", "wait 2 mins", "ruk 2 min"),
+            ("en", "hi", "sounds good", "sahi hai"),
+            ("en", "hi", "good night", "good night / shubh ratri"),
+            ("en", "hi", "thank you", "shukriya / thanks"),
+            ("en", "hi", "see you tomorrow", "kal milte hai"),
+            ("en", "hi", "got it", "samajh gaya"),
+
+            # Spanish (es) -> English (en)
+            ("es", "en", "hola", "hello"),
+            ("es", "en", "que tal", "what's up"),
+            ("es", "en", "¿que tal?", "what's up?"),
+            ("es", "en", "como estas", "how are you"),
+            ("es", "en", "¿como estas?", "how are you?"),
+            ("es", "en", "vamos a jugar", "let's play"),
+            ("es", "en", "buenas noches", "good night"),
+            ("es", "en", "buenos dias", "good morning"),
+            ("es", "en", "muchas gracias", "thank you very much"),
+            ("es", "en", "de nada", "you're welcome"),
+            ("es", "en", "hasta mañana", "see you tomorrow"),
+            ("es", "en", "esta bien", "alright"),
+
+            # Japanese (ja) -> English (en)
+            ("ja", "en", "こんにちは", "hello"),
+            ("ja", "en", "こんばんは", "good evening"),
+            ("ja", "en", "おはよう", "good morning"),
+            ("ja", "en", "お疲れ様", "good work / thanks"),
+            ("ja", "en", "ゲームしよう", "let's play a game"),
+            ("ja", "en", "ありがとう", "thank you"),
+            ("ja", "en", "また明日", "see you tomorrow"),
+        ]
+
+        await self._conn.executemany("""
+            INSERT OR IGNORE INTO translation_cache 
+            (source_lang, target_lang, source_text, translated_text)
+            VALUES (?, ?, ?, ?);
+        """, [(s.lower(), t.lower(), src.strip().lower(), trans) for s, t, src, trans in common_pairs])
+        await self._conn.commit()

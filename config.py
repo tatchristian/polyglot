@@ -19,7 +19,6 @@ MYMEMORY_EMAIL = os.getenv("MYMEMORY_EMAIL", "").strip()
 # Groq Model Pool with Automatic Cascading Failover
 GROQ_MODELS = [
     "qwen/qwen3.8-27b",
-    "llama-3.1-8b-instant",
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
 ]

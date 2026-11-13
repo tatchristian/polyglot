@@ -4,7 +4,7 @@ import time
 import asyncio
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from config import DISCORD_TOKEN, CHANNELS
 from translator import TranslationService
 from relay import WebhookRelayManager
@@ -15,7 +15,7 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 db_manager = DatabaseManager()
-translator_service = TranslationService()
+translator_service = TranslationService(db=db_manager)
 relay_manager = WebhookRelayManager(bot, translator_service, db_manager)
 start_time = time.time()
 
@@ -42,11 +42,48 @@ SUPPORTED_LANGUAGES = [
     app_commands.Choice(name="Ukrainian (uk)", value="uk"),
 ]
 
+FLAG_LANG_MAP = {
+    "🇪🇸": "es", "🇲🇽": "es",
+    "🇯🇵": "ja",
+    "🇫🇷": "fr",
+    "🇩🇪": "de",
+    "🇮🇳": "hi",
+    "🇰🇷": "ko",
+    "🇺🇸": "en", "🇬🇧": "en",
+    "🇮🇹": "it",
+    "🇵🇹": "pt", "🇧🇷": "pt",
+    "🇷🇺": "ru",
+    "🇨🇳": "zh",
+    "🇻🇳": "vi",
+    "🇹🇭": "th",
+    "🇵🇭": "tl",
+    "🇹🇷": "tr",
+    "🇳🇱": "nl",
+    "🇵🇱": "pl",
+    "🇺🇦": "uk",
+    "🇸🇦": "ar",
+    "🇮🇩": "id"
+}
+
+@tasks.loop(hours=24)
+async def database_prune_task():
+    """Daily background task to prune message sync records older than 60 days."""
+    try:
+        deleted = await db_manager.prune_old_sync_records(days=60)
+        if deleted > 0:
+            print(f"🧹 Pruned {deleted} old sync records (>60 days old).")
+    except Exception as e:
+        print(f"Database prune task error: {e}")
+
 @bot.event
 async def on_ready():
     await db_manager.connect()
     await db_manager.seed_default_channels(CHANNELS)
+    await db_manager.seed_common_translations()
     await relay_manager.sync_channel_cache()
+
+    if not database_prune_task.is_running():
+        database_prune_task.start()
 
     print(f"✅ Logged in as {bot.user.name} ({bot.user.id})")
     print(f"🗄️ SQLite Database connected (WAL mode active).")
@@ -63,6 +100,51 @@ async def on_ready():
             print(f"   • Channel ID {channel_id} [{lang}]{mode} -> Not cached or not TextChannel")
 
 @bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """Translates a message on-demand when any user reacts with a country flag emoji."""
+    emoji_str = str(payload.emoji)
+    target_lang = FLAG_LANG_MAP.get(emoji_str)
+    if not target_lang:
+        return
+
+    # Don't translate bot reactions
+    if bot.user and payload.user_id == bot.user.id:
+        return
+
+    channel = bot.get_channel(payload.channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        msg = await channel.fetch_message(payload.message_id)
+        if not msg.content or (msg.author.bot and not msg.webhook_id):
+            return
+
+        user = bot.get_user(payload.user_id) or await bot.fetch_user(payload.user_id)
+
+        # Translate on demand
+        translated_chunks = await translator_service.translate(
+            text=msg.content,
+            source_lang="auto",
+            target_lang=target_lang
+        )
+        if not translated_chunks:
+            return
+
+        translated_text = " ".join(translated_chunks)
+        embed = discord.Embed(
+            title=f"{emoji_str} Translation ({target_lang.upper()})",
+            description=translated_text,
+            color=0x3498DB
+        )
+        embed.set_author(name=msg.author.display_name, icon_url=msg.author.display_avatar.url)
+        embed.set_footer(text=f"Requested by {user.display_name} • Polyglot Quick Translate")
+
+        await channel.send(embed=embed, reference=msg, mention_author=False)
+    except Exception as e:
+        print(f"Flag translation error: {e}")
+
+@bot.event
 async def on_message(message: discord.Message):
     await relay_manager.relay_message(message)
     await bot.process_commands(message)
@@ -76,6 +158,7 @@ async def on_message_delete(message: discord.Message):
     await relay_manager.handle_message_delete(message)
 
 @bot.tree.command(name="translate-add", description="Link a Discord text channel to a translation language.")
+@app_commands.default_permissions(manage_channels=True)
 @app_commands.describe(
     channel="The text channel to link",
     language="The language spoken in this channel",
@@ -111,6 +194,7 @@ async def translate_add(
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="translate-remove", description="Unlink a channel from the translation network.")
+@app_commands.default_permissions(manage_channels=True)
 @app_commands.describe(channel="The channel to unlink")
 async def translate_remove(interaction: discord.Interaction, channel: discord.TextChannel):
     """Removes a channel from the translation network."""
@@ -132,6 +216,177 @@ async def translate_remove(interaction: discord.Interaction, channel: discord.Te
             color=0xF1C40F
         )
     await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="translate-setup", description="1-Click Wizard: Automatically creates category and paired language channels.")
+@app_commands.default_permissions(manage_channels=True)
+async def translate_setup(interaction: discord.Interaction):
+    """Automatically creates a '🌍 Polyglot Network' category with #english, #spanish, #japanese, #hindi."""
+    await interaction.response.defer(ephemeral=False)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("❌ This command can only be used inside a Discord server.")
+        return
+
+    me = guild.me
+    if not me.guild_permissions.manage_channels or not me.guild_permissions.manage_webhooks:
+        await interaction.followup.send("❌ Bot needs **Manage Channels** and **Manage Webhooks** permissions to run auto-setup.")
+        return
+
+    try:
+        category = discord.utils.get(guild.categories, name="🌍 Polyglot Network")
+        if not category:
+            category = await guild.create_category("🌍 Polyglot Network")
+
+        preset_channels = [
+            ("english", "en", False),
+            ("spanish", "es", False),
+            ("japanese", "ja", False),
+            ("hindi", "hi", True),
+        ]
+
+        created_info = []
+        for ch_name, lang_code, is_romanized in preset_channels:
+            ch = discord.utils.get(category.text_channels, name=ch_name)
+            if not ch:
+                ch = await category.create_text_channel(name=ch_name)
+
+            await db_manager.add_channel(ch.id, lang_code, is_romanized=is_romanized)
+            relay_manager.add_channel_to_cache(ch.id, lang_code, is_romanized)
+            await relay_manager.get_or_create_webhook(ch)
+            roman_note = " *(AI Romanized)*" if is_romanized else ""
+            created_info.append(f"• {ch.mention} [**{lang_code.upper()}**]{roman_note}")
+
+        embed = discord.Embed(
+            title="🎉 Polyglot Network Configured!",
+            description="The translation network has been automatically set up:\n\n" + "\n".join(created_info) + "\n\nAny message sent in one of these channels will automatically relay and translate to the others!",
+            color=0x2ECC71
+        )
+        embed.set_footer(text="Ready to chat! Use // at start of message to opt-out.")
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Error during auto-setup: `{e}`")
+
+@bot.tree.command(name="translate-doctor", description="Audits channel permissions, webhooks, and translation engine health.")
+@app_commands.default_permissions(manage_channels=True)
+async def translate_doctor(interaction: discord.Interaction):
+    """Audits all active channels for required permissions, webhooks, and provider status."""
+    await interaction.response.defer(ephemeral=False)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("❌ This command can only be used inside a Discord server.")
+        return
+
+    channel_reports = []
+    all_ok = True
+
+    for cid, info in relay_manager.channels.items():
+        ch = guild.get_channel(cid)
+        if not ch or not isinstance(ch, discord.TextChannel):
+            continue
+
+        perms = ch.permissions_for(guild.me)
+        missing_perms = []
+        if not perms.manage_webhooks:
+            missing_perms.append("Manage Webhooks")
+        if not perms.send_messages:
+            missing_perms.append("Send Messages")
+        if not perms.view_channel:
+            missing_perms.append("View Channel")
+        if not perms.read_message_history:
+            missing_perms.append("Read Message History")
+
+        wh_ok = cid in relay_manager.webhooks
+        if not wh_ok:
+            try:
+                await relay_manager.get_or_create_webhook(ch)
+                wh_ok = True
+            except Exception:
+                wh_ok = False
+
+        if missing_perms or not wh_ok:
+            all_ok = False
+            issues = []
+            if missing_perms:
+                issues.append(f"Missing perms: `{', '.join(missing_perms)}`")
+            if not wh_ok:
+                issues.append("Webhook creation failed")
+            channel_reports.append(f"⚠️ {ch.mention} [{info['lang'].upper()}]: " + " | ".join(issues))
+        else:
+            channel_reports.append(f"✅ {ch.mention} [{info['lang'].upper()}]: Permissions & Webhook ready")
+
+    cb_status = []
+    for name, cb in translator_service.circuit_breakers.items():
+        state_icon = "🟢 Healthy" if cb.is_healthy else f"🔴 Cooldown ({int(max(0, cb.cooldown_until - time.time()))}s left)"
+        cb_status.append(f"• **{name}**: {state_icon}")
+
+    embed = discord.Embed(
+        title="🩺 Polyglot Translation Doctor",
+        description="Health and permission audit across your server channels:",
+        color=0x2ECC71 if all_ok else 0xE67E22
+    )
+
+    embed.add_field(
+        name="Channel Permission & Webhook Audit",
+        value="\n".join(channel_reports) if channel_reports else "No channels configured in this server.",
+        inline=False
+    )
+    embed.add_field(
+        name="Translation Engine Circuit Breakers",
+        value="\n".join(cb_status),
+        inline=False
+    )
+
+    if all_ok:
+        embed.set_footer(text="Everything is healthy! All messages will relay smoothly.")
+    else:
+        embed.set_footer(text="Action required: Grant the missing permissions to Polyglot Bot.")
+
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.context_menu(name="View Original Text")
+async def view_original_text(interaction: discord.Interaction, message: discord.Message):
+    """Context menu to view the original untranslated text of any relayed message."""
+    await interaction.response.defer(ephemeral=True)
+
+    info = await db_manager.get_source_message_info(message.id)
+    if not info:
+        await interaction.followup.send(
+            "ℹ️ This message was not found in the translation sync database (it may be a direct message or sent before bot was installed).",
+            ephemeral=True
+        )
+        return
+
+    src_channel_id, src_message_id = info
+    src_channel = bot.get_channel(src_channel_id)
+
+    original_author = "Unknown"
+    original_content = "Could not fetch original content."
+    original_avatar = None
+    created_at_str = "Unknown"
+
+    if isinstance(src_channel, discord.TextChannel):
+        try:
+            src_msg = await src_channel.fetch_message(src_message_id)
+            original_author = src_msg.author.display_name
+            original_content = src_msg.content or "*(Attachment only)*"
+            original_avatar = src_msg.author.display_avatar.url
+            created_at_str = src_msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            original_content = "Original message may have been deleted."
+
+    embed = discord.Embed(
+        title="🔍 Original Message Details",
+        description=original_content,
+        color=0x3498DB
+    )
+    embed.add_field(name="Original Author", value=original_author, inline=True)
+    embed.add_field(name="Source Channel", value=f"<#{src_channel_id}>", inline=True)
+    embed.add_field(name="Sent At", value=created_at_str, inline=True)
+    if original_avatar:
+        embed.set_thumbnail(url=original_avatar)
+    embed.set_footer(text="Polyglot Message Verification • Visible only to you")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="translate-status", description="Displays Polyglot translation bot health, channels, and metrics.")
 async def translate_status(interaction: discord.Interaction):
@@ -165,9 +420,20 @@ async def translate_status(interaction: discord.Interaction):
     db_stats = await db_manager.get_stats()
     ai_stats = relay_manager.normalizer.stats
 
+    total_tr = stats.get("total_translated", 0)
+    cache_hits = stats.get("cache_hits", 0)
+    hit_rate = round((cache_hits / total_tr * 100), 1) if total_tr > 0 else 0.0
+
+    cb_lines = []
+    for name, cb in translator_service.circuit_breakers.items():
+        icon = "🟢" if cb.is_healthy else "🔴 Cooldown"
+        cb_lines.append(f"`{name}`: {icon}")
+    cb_text = " | ".join(cb_lines)
+
     stats_text = (
         f"• Total Translations: **{stats['total_translated']}**\n"
-        f"• Cache Hits (Zero-API Saved): **{stats.get('cache_hits', 0)}**\n"
+        f"• Cache Hit Rate: **{hit_rate}%** ({cache_hits} Zero-Cost Hits Saved)\n"
+        f"• Circuit Breakers: {cb_text}\n"
         f"• DeepL: `{stats['deepl_success']}` | Azure: `{stats['azure_success']}`\n"
         f"• MyMemory: `{stats['mymemory_success']}` | Google: `{stats['google_success']}`\n"
         f"• LLM Cascading Failover: `{stats.get('llm_success', 0)}` (Multi-Model Pool)\n"

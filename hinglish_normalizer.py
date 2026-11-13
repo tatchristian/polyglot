@@ -1,77 +1,36 @@
 """AI Normalizer, Romanizer, and General Translation Service using Groq and OpenRouter Model Pools."""
 
 import os
+import re
 import asyncio
 from typing import Optional, List
 import httpx
 from groq import AsyncGroq
 from config import GROQ_API_KEY, OPENROUTER_API_KEY, GROQ_MODELS, OPENROUTER_MODELS
 
-HINGLISH_TO_ENGLISH_PROMPT = """You are an elite bilingual translator specializing in Indian Discord chat, gaming banter, Hindi, and Hinglish slang.
-Your objective is to translate Hinglish (Hindi written in Roman/Latin script) OR Devanagari Hindi into NATURAL, IDIOMATIC, and CASUAL English as spoken in modern Discord gaming communities.
-
-CRITICAL RULES:
-1. IDIOMS & INTENT: Never translate word-for-word literally. Capture the true colloquial meaning, mood, and banter!
-   - "isse kaise inaccurate keh rahe ho?" -> "How are you saying this is inaccurate?" / "In what way is this inaccurate?"
-   - "bhai kya scene hai?" -> "Bro what's the plan?" / "What's going on?"
-   - "Aap ki pohoch bohot zyada he" -> "Your reach is insane" / "You've got crazy connections"
-   - "Tu bach ke rehna" -> "You better watch your back" / "Stay alert"
-   - "Bhai ka alag hi swag hai" -> "Bro is on another level"
-   - "Banda tagda hai" -> "That guy is cracked / really good"
-   - "Pata tha, yehi hoga" -> "Called it, knew this would happen"
-   - "kuch samajh nahi aa raha" -> "This makes zero sense" / "I don't understand anything"
-   - "ye sahi nahi chal raha" -> "This isn't working properly"
-   - "lagta hai bug hai" -> "Looks like there's a bug"
-   - "dekhne me galat lagta hai" -> "It looks wrong"
-   - "bt mat de" -> "Don't stress me out" / "Stop killing the vibe"
-   - "ruk 2 min aara hu" -> "Wait 2 mins, I'm on my way"
-   - "khelna hai kya kisi ko?" -> "Anyone down to play?"
-   - "aaja vc" -> "Hop in VC"
-   - "shuru ho gaya fir se" -> "Here we go again"
-2. ALREADY ENGLISH: If the message is already in English (e.g. "ok bro", "no way", "what time?", "gg", "lol"), return it directly in English without unnecessary alteration.
-3. SCRIPT SUPPORT: Accurately translate both Latin script (Hinglish) and Devanagari script (e.g. "यह सही नहीं है" -> "This isn't right").
-4. GAMING & SLANG: Preserve gaming terminology (e.g. clutch, diff, throw, bot, feed, gg, scrims, cracked, ping) and playful sarcasm.
-5. PRESERVE SYNTAX TOKENS: Never modify or drop tokens like __DISCORD_MENTION_0__, __DISCORD_EMOJI_0__, or `<@...>`. Leave them in place.
-6. OUTPUT: Output ONLY the translated English sentence. No explanations, no notes, no quotes.
+HINGLISH_TO_ENGLISH_PROMPT = """Translate Hinglish (Roman/Devanagari Hindi) into casual, idiomatic Discord gaming English.
+Rules:
+1. Capture conversational banter/intent, never literal word-for-word:
+   - "isse kaise inaccurate keh rahe ho?" -> "In what way is this inaccurate?"
+   - "lagta hai change karna padega" -> "Looks like I'll have to change it"
+   - "khelna hai kya" -> "Anyone down to play?"
+   - "bhai kya scene hai" -> "Bro what's the plan?"
+2. If already English, return as-is. Preserve gaming slang (clutch, diff, ping, gg).
+3. NEVER modify syntax tokens like __DISCORD_MENTION_0__ or `<@...>`.
+4. Output ONLY the translated English sentence without quotes or explanations.
 """
 
-ENGLISH_TO_HINGLISH_PROMPT = """You are an elite bilingual gamer and native Hindi speaker. Translate the input English message into natural, grammatically flawless Romanized Hindi (Hinglish in English/Latin alphabet) as spoken casually among Indian friends on Discord.
-
-CRITICAL GRAMMAR & VOCABULARY RULES:
-1. COMPOUND VERBS (Samyukt Kriya) - STRICT RULE:
-   - In Hindi, compound verbs use the ROOT form of the main verb + the auxiliary verb:
-     * "made it" / "built this" -> "bana diya" (ABSOLUTELY NEVER "banaya diya")
-     * "did it" -> "kar diya" (ABSOLUTELY NEVER "kiya diya")
-     * "gave it" -> "de diya" (ABSOLUTELY NEVER "diya diya")
-     * "sent it" -> "bhej diya" (ABSOLUTELY NEVER "bheja diya")
-     * "checked/saw it" -> "dekh liya" (ABSOLUTELY NEVER "dekha liya")
-     * "changed it" -> "badal diya" / "change kar diya" (ABSOLUTELY NEVER "badla diya")
-2. LOANWORD GENDER AGREEMENT:
-   - Tech and Discord loanwords (bot, feature, server, update, message, ping, code, bug, channel) are masculine in Urban Hindi:
-     * "yeh feature" / "aisa feature" (NEVER "aisi feature")
-     * "dusra bot" / "achha bot" (NEVER "dusri bot")
-     * "naya server" (NEVER "nayi server")
-3. NATURAL COLLOQUIAL PHRASING (Avoid Robotic Literal Translations):
-   - "in what way is it inaccurate?" -> "Kyun, isme kya galat lag raha hai?" / "Yeh kaise inaccurate lag raha hai?"
-   - "oh shit it might ping people 4 times in a row" -> "Arre yaar, yeh toh logon ko 4 baar lagataar ping kar dega"
-   - "I might have to change that" -> "Lagta hai mujhe yeh badalna padega" / "Shayad mujhe yeh change karna padega"
-   - "the grammar is broken and looks wrong" -> "Grammar kharab hai aur dekhne mein galat lag raha hai"
-   - "bro the other bot had this feature but charged $10, so I used AI to build this lol"
-     -> "Bhai dusre bot mein bhi yeh feature tha, par woh mahine ke $10 maang rahe the, toh maine AI use karke yeh bana diya lol"
-   - "does anyone want to play tonight?" -> "Aaj raat koi khelega kya?"
-   - "let me check" -> "Ruk main check karta hoon"
-4. URBAN HINDI SPELLING STANDARDS:
-   - Use standard phonetic spelling:
-     * 'hai' (NOT 'he' or 'h')
-     * 'kya' (NOT 'kiya')
-     * 'nahi' (NOT 'nahe' or 'ni')
-     * 'raha hai' / 'rahe ho' (NOT 'rha h')
-     * 'karna' / 'kar rahe' (NOT 'kr')
-     * 'achha' / 'sahi'
-5. PRESERVE SYNTAX PLACEHOLDERS & GAMING TERMS:
-   - NEVER alter, translate, or remove tokens like __DISCORD_MENTION_0__, __DISCORD_EMOJI_0__, or `<@...>`. Leave them exactly where they are.
-   - Keep common Discord terms in English: "ping", "bot", "server", "VC", "channel", "feature", "lol", "lmao", "gg", "bro".
-6. OUTPUT: Output ONLY the translated Hinglish sentence. No quotes, no markdown fences, no explanations.
+ENGLISH_TO_HINGLISH_PROMPT = """Translate English to natural Romanized Hindi (Hinglish in Latin script) for Discord gaming chat.
+Rules:
+1. Compound Verbs: Root verb + auxiliary (e.g. "bana diya" NEVER "banaya diya", "kar diya", "bhej diya").
+2. Tech Loanword Agreement: Masculine gender ("yeh feature", "achha bot", "naya server").
+3. Natural Phrasing:
+   - "In what way is this inaccurate?" -> "isse kaise inaccurate keh rahe ho?"
+   - "I might have to change that" -> "lagta hai change karna padega"
+   - "Anyone down to play?" -> "khelna hai kya"
+4. Standard phonetic spelling: 'hai' (not 'he'), 'nahi' (not 'ni'), 'kya' (not 'kiya').
+5. NEVER modify syntax tokens like __DISCORD_MENTION_0__ or `<@...>`.
+6. Output ONLY the translated Hinglish sentence without quotes or explanations.
 """
 
 class HinglishNormalizer:
@@ -172,9 +131,12 @@ class HinglishNormalizer:
         parent_context: Optional[str] = None
     ) -> Optional[str]:
         """Interprets Hinglish text into clean English using parent context and cascading models."""
-        user_content = text
+        cleaned_text = re.sub(r'[ \t]+', ' ', text.strip())
+        cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+        user_content = cleaned_text
         if parent_context and parent_context.strip():
-            user_content = f"Context (in reply to): '{parent_context.strip()}'\nMessage to interpret: '{text}'"
+            clean_parent = re.sub(r'[ \t]+', ' ', parent_context.strip())
+            user_content = f"Context (in reply to): '{clean_parent}'\nMessage to interpret: '{cleaned_text}'"
 
         result = await self._call_llm(
             messages=[
@@ -190,10 +152,12 @@ class HinglishNormalizer:
 
     async def to_romanized_hindi(self, text: str) -> Optional[str]:
         """Translates text into natural Romanized Hindi (Hinglish in English alphabet)."""
+        cleaned_text = re.sub(r'[ \t]+', ' ', text.strip())
+        cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
         result = await self._call_llm(
             messages=[
                 {"role": "system", "content": ENGLISH_TO_HINGLISH_PROMPT},
-                {"role": "user", "content": text}
+                {"role": "user", "content": cleaned_text}
             ],
             temperature=0.3,
             max_tokens=256

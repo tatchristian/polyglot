@@ -94,3 +94,77 @@ async def test_delete_relayed_messages():
     assert remaining == []
 
     await db.close()
+
+@pytest.mark.asyncio
+async def test_get_source_message_info():
+    db = DatabaseManager(db_path=":memory:")
+    await db.connect()
+
+    conv_uuid = "conv-src-info"
+    await db.record_relayed_messages(
+        conversation_uuid=conv_uuid,
+        source_channel_id=111,
+        source_message_id=222,
+        relays=[(333, 444)]
+    )
+
+    # Lookup via source ID
+    info_from_src = await db.get_source_message_info(222)
+    assert info_from_src == (111, 222)
+
+    # Lookup via relayed ID
+    info_from_relay = await db.get_source_message_info(444)
+    assert info_from_relay == (111, 222)
+
+    # Lookup non-existent
+    assert await db.get_source_message_info(999999) is None
+
+    await db.close()
+
+@pytest.mark.asyncio
+async def test_prune_old_sync_records():
+    db = DatabaseManager(db_path=":memory:")
+    await db.connect()
+
+    # Insert a simulated old record (e.g. 70 days ago) and a recent record
+    await db._conn.execute("""
+        INSERT INTO message_sync (conversation_uuid, source_channel_id, source_message_id, dest_channel_id, relayed_message_id, created_at)
+        VALUES ('old-conv', 101, 1001, 102, 1002, datetime('now', '-70 days'));
+    """)
+    await db._conn.execute("""
+        INSERT INTO message_sync (conversation_uuid, source_channel_id, source_message_id, dest_channel_id, relayed_message_id, created_at)
+        VALUES ('new-conv', 101, 2001, 102, 2002, datetime('now', '-10 days'));
+    """)
+    await db._conn.commit()
+
+    # Prune records older than 60 days
+    pruned_count = await db.prune_old_sync_records(days=60)
+    assert pruned_count == 1
+
+    # Only new-conv should remain
+    assert await db.find_conversation_uuid(1001) is None
+    assert await db.find_conversation_uuid(2001) == "new-conv"
+
+    await db.close()
+
+@pytest.mark.asyncio
+async def test_seed_common_translations():
+    db = DatabaseManager(db_path=":memory:")
+    await db.connect()
+
+    # Pre-seed common translations
+    await db.seed_common_translations()
+
+    # Check Hinglish phrase lookup
+    hi_tr = await db.get_cached_translation("hi", "en", "kya scene hai")
+    assert hi_tr == "What's the plan?"
+
+    # Check Spanish phrase lookup
+    es_tr = await db.get_cached_translation("es", "en", "como estas")
+    assert es_tr == "how are you"
+
+    # Check Japanese phrase lookup
+    ja_tr = await db.get_cached_translation("ja", "en", "こんにちは")
+    assert ja_tr == "hello"
+
+    await db.close()

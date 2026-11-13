@@ -110,3 +110,42 @@ def test_accept_attachment_only_message(relay_manager):
     msg.attachments = [att_mock]
 
     assert relay_manager.should_process_message(msg) is True
+
+@pytest.mark.asyncio
+async def test_passthrough_message_bypasses_ai_normalization(relay_manager):
+    from unittest.mock import AsyncMock
+    # Channel 555 is a Romanized Hindi channel
+    relay_manager.channels[555] = {"lang": "hi", "is_romanized": True}
+    relay_manager.normalizer.normalize_hinglish = AsyncMock()
+
+    msg = MagicMock(spec=discord.Message)
+    msg.author.bot = False
+    msg.webhook_id = None
+    msg.channel = MagicMock(spec=discord.TextChannel)
+    msg.channel.id = 555
+    msg.channel.name = "hindi"
+    msg.content = "https://tenor.com/view/funny-cat"
+    msg.attachments = []
+    msg.reference = None
+
+    relay_manager.should_process_message = MagicMock(return_value=True)
+    relay_manager.bot.get_channel = MagicMock(return_value=None)
+
+    await relay_manager.relay_message(msg)
+
+    # Groq AI normalizer must NOT have been called!
+    relay_manager.normalizer.normalize_hinglish.assert_not_called()
+
+def test_ignore_privacy_opt_out_prefixes(relay_manager):
+    channel_id = list(CHANNELS.keys())[0] if CHANNELS else 123
+    relay_manager.channels[channel_id] = {"lang": "en", "is_romanized": False}
+
+    for prefix in ["// secret local message", "//dont relay", "/* block comment */", "//"]:
+        msg = MagicMock(spec=discord.Message)
+        msg.author.bot = False
+        msg.webhook_id = None
+        msg.channel = MagicMock(spec=discord.TextChannel)
+        msg.channel.id = channel_id
+        msg.content = prefix
+
+        assert relay_manager.should_process_message(msg) is False
