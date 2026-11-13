@@ -48,3 +48,19 @@ async def test_hinglish_normalizer_fallback_on_error():
     result = await normalizer.normalize_hinglish("bhai fail ho gaya")
     assert result is None
     assert normalizer.stats["groq_failures"] == 1
+
+@pytest.mark.asyncio
+async def test_to_romanized_hindi_success():
+    normalizer = HinglishNormalizer(api_key="mock_key")
+
+    mock_chat = AsyncMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = "Kal tournament kitne baje hai?"
+    mock_response = MagicMock(choices=[mock_choice])
+    mock_chat.completions.create.return_value = mock_response
+
+    normalizer.client.chat = mock_chat
+
+    result = await normalizer.to_romanized_hindi("What time is the tournament tomorrow?")
+    assert result == "Kal tournament kitne baje hai?"
+    assert normalizer.stats["groq_to_romanized"] == 1

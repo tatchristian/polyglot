@@ -177,7 +177,27 @@ class WebhookRelayManager:
             target_lang = dest_info["lang"]
 
             if text_to_translate:
-                if normalized_english:
+                # If target channel is configured as Romanized Hindi, deliver conversational Hinglish
+                if target_lang == "hi" and dest_info.get("is_romanized", False):
+                    base_english = normalized_english
+                    if not base_english:
+                        en_chunks = await self.translator.translate(
+                            text=text_to_translate,
+                            source_lang=source_lang,
+                            target_lang="en"
+                        )
+                        base_english = en_chunks[0] if en_chunks else text_to_translate
+
+                    romanized = await self.normalizer.to_romanized_hindi(base_english)
+                    if romanized:
+                        chunks = [romanized]
+                    else:
+                        chunks = await self.translator.translate(
+                            text=base_english,
+                            source_lang="en",
+                            target_lang="hi"
+                        )
+                elif normalized_english:
                     if target_lang == "en":
                         chunks = [normalized_english]
                     else:
@@ -268,11 +288,21 @@ class WebhookRelayManager:
             if not isinstance(dest_channel, discord.TextChannel):
                 return
 
-            chunks = await self.translator.translate(
-                text=updated_text,
-                source_lang=source_lang,
-                target_lang=target_lang
-            )
+            if target_lang == "hi" and dest_info.get("is_romanized", False):
+                en_chunks = await self.translator.translate(
+                    text=updated_text,
+                    source_lang=source_lang,
+                    target_lang="en"
+                )
+                base_en = en_chunks[0] if en_chunks else updated_text
+                romanized = await self.normalizer.to_romanized_hindi(base_en)
+                chunks = [romanized] if romanized else [base_en]
+            else:
+                chunks = await self.translator.translate(
+                    text=updated_text,
+                    source_lang=source_lang,
+                    target_lang=target_lang
+                )
             if not chunks:
                 return
 
