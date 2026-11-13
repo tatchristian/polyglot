@@ -105,10 +105,10 @@ class WebhookRelayManager:
         self.webhooks[channel.id] = wh
         return wh
 
-    async def _build_reply_header(self, message: discord.Message) -> Tuple[str, Optional[str]]:
-        """Builds a cross-channel reply quote header if the message is a reply."""
+    async def _get_reply_context(self, message: discord.Message) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Extracts (author_name, raw_snippet, parent_uuid) if message is a reply."""
         if not message.reference or not message.reference.message_id:
-            return "", None
+            return None, None, None
 
         parent_uuid = await self.db.find_conversation_uuid(message.reference.message_id)
 
@@ -120,16 +120,92 @@ class WebhookRelayManager:
                 ref_msg = None
 
         if not ref_msg:
-            return "┌ 💬 *Replying to a previous message*\n", parent_uuid
+            return "a previous message", None, parent_uuid
 
         author_name = ref_msg.author.display_name
-        snippet = ref_msg.content.replace("\n", " ").strip()
-        if len(snippet) > 60:
-            snippet = snippet[:57] + "..."
-        snippet_text = f': "{snippet}"' if snippet else ""
+        clean_content = ref_msg.content or ""
+        # If the referenced message was already a bot relay with a reply header, strip the header
+        if clean_content.startswith("┌ 💬"):
+            lines = clean_content.split("\n", 1)
+            clean_content = lines[1] if len(lines) > 1 else ""
 
-        header = f"┌ 💬 Replying to **@{author_name}**{snippet_text}\n"
-        return header, parent_uuid
+        snippet = clean_content.replace("\n", " ").strip()
+        return author_name, snippet, parent_uuid
+
+    async def _translate_snippet(
+        self,
+        raw_snippet: str,
+        source_lang: str,
+        target_lang: str,
+        is_target_romanized: bool = False,
+        is_source_romanized: bool = False
+    ) -> str:
+        """Translates a reply snippet into the destination channel's language."""
+        if not raw_snippet:
+            return ""
+
+        # Normalize source to base English
+        base_en = None
+        if source_lang == "hi" and is_source_romanized:
+            base_en = await self.normalizer.normalize_hinglish(raw_snippet)
+
+        if not base_en:
+            if source_lang == "en":
+                base_en = raw_snippet
+            else:
+                en_chunks = await self.translator.translate(
+                    text=raw_snippet,
+                    source_lang=source_lang,
+                    target_lang="en"
+                )
+                base_en = en_chunks[0] if en_chunks else raw_snippet
+
+        # Render into target language
+        if target_lang == "en":
+            translated = base_en
+        elif target_lang == "hi" and is_target_romanized:
+            roman_raw = await self.normalizer.to_romanized_hindi(base_en)
+            translated = roman_raw if roman_raw else base_en
+        else:
+            chunks = await self.translator.translate(
+                text=base_en,
+                source_lang="en",
+                target_lang=target_lang
+            )
+            translated = chunks[0] if chunks else base_en
+
+        if len(translated) > 60:
+            translated = translated[:57] + "..."
+        return translated
+
+    async def _build_reply_header(
+        self,
+        author_name: Optional[str],
+        raw_snippet: Optional[str],
+        source_lang: str,
+        target_lang: str,
+        is_target_romanized: bool = False,
+        is_source_romanized: bool = False
+    ) -> str:
+        """Constructs the localized reply header for a destination channel."""
+        if not author_name:
+            return ""
+        if not raw_snippet:
+            return f"┌ 💬 Replying to **@{author_name}**\n"
+
+        try:
+            translated_snippet = await self._translate_snippet(
+                raw_snippet=raw_snippet,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                is_target_romanized=is_target_romanized,
+                is_source_romanized=is_source_romanized
+            )
+            return f"┌ 💬 Replying to **@{author_name}**: \"{translated_snippet}\"\n"
+        except Exception as e:
+            print(f"Error translating reply snippet: {e}")
+            snippet = raw_snippet[:57] + "..." if len(raw_snippet) > 60 else raw_snippet
+            return f"┌ 💬 Replying to **@{author_name}**: \"{snippet}\"\n"
 
     async def relay_message(self, message: discord.Message):
         """Translates and fans out a message with Romanized AI normalizer support."""
@@ -141,7 +217,7 @@ class WebhookRelayManager:
         is_romanized_channel = channel_info.get("is_romanized", False)
 
         conv_uuid = str(uuid.uuid4())
-        reply_header, parent_uuid = await self._build_reply_header(message)
+        reply_author, raw_snippet, parent_uuid = await self._get_reply_context(message)
 
         attachment_text = ""
         if message.attachments:
@@ -225,6 +301,17 @@ class WebhookRelayManager:
             else:
                 chunks = [""]
 
+            reply_header = ""
+            if reply_author:
+                reply_header = await self._build_reply_header(
+                    author_name=reply_author,
+                    raw_snippet=raw_snippet,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    is_target_romanized=dest_info.get("is_romanized", False),
+                    is_source_romanized=is_romanized_channel
+                )
+
             if reply_header and chunks:
                 chunks[0] = reply_header + chunks[0]
 
@@ -286,7 +373,7 @@ class WebhookRelayManager:
         if not updated_text:
             return
 
-        reply_header, _ = await self._build_reply_header(after)
+        reply_author, raw_snippet, _ = await self._get_reply_context(after)
 
         async def edit_single_channel(dest_channel_id: int, webhook_msg_id: int):
             dest_info = self.channels.get(dest_channel_id)
@@ -301,7 +388,10 @@ class WebhookRelayManager:
             if after.guild and dest_channel.guild.id != after.guild.id:
                 return
 
-            if target_lang == "hi" and dest_info.get("is_romanized", False):
+            target_lang = dest_info["lang"]
+            is_target_romanized = dest_info.get("is_romanized", False)
+
+            if target_lang == "hi" and is_target_romanized:
                 en_chunks = await self.translator.translate(
                     text=updated_text,
                     source_lang=source_lang,
@@ -318,6 +408,17 @@ class WebhookRelayManager:
                 )
             if not chunks:
                 return
+
+            reply_header = ""
+            if reply_author:
+                reply_header = await self._build_reply_header(
+                    author_name=reply_author,
+                    raw_snippet=raw_snippet,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    is_target_romanized=is_target_romanized,
+                    is_source_romanized=channel_info.get("is_romanized", False)
+                )
 
             content_to_send = (reply_header + chunks[0]) if reply_header else chunks[0]
 
