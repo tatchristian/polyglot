@@ -15,6 +15,7 @@ from deep_translator import (
 from deep_translator.exceptions import TooManyRequests
 from config import (
     MAX_DISCORD_MESSAGE_LENGTH,
+    MAX_LRU_CACHE_SIZE,
     DEEPL_API_KEY,
     AZURE_TRANSLATOR_KEY,
     AZURE_REGION,
@@ -214,7 +215,7 @@ def _is_rate_limit_error(e: Exception) -> bool:
 class TranslationService:
     """Manages translation with cascading multi-provider fallback, circuit breakers, LRU & SQLite caching, and LLM failover."""
 
-    def __init__(self, llm_service=None, db=None, cache_size: int = 2000):
+    def __init__(self, llm_service=None, db=None, cache_size: int = MAX_LRU_CACHE_SIZE):
         self.llm_service = llm_service
         self.db = db
         self.cache_size = cache_size

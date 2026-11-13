@@ -73,9 +73,33 @@ class DatabaseManager:
                 relayed_message_id INTEGER NOT NULL,
                 parent_uuid TEXT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (conversation_uuid, dest_channel_id)
+                PRIMARY KEY (conversation_uuid, dest_channel_id, relayed_message_id)
             );
         """)
+
+        # Migration check: Upgrade message_sync to include relayed_message_id in primary key
+        try:
+            async with self._conn.execute("PRAGMA table_info(message_sync);") as cur:
+                columns = await cur.fetchall()
+                relayed_pk = any(col[1] == "relayed_message_id" and col[5] > 0 for col in columns)
+                if columns and not relayed_pk:
+                    await self._conn.execute("""
+                        CREATE TABLE message_sync_v2 (
+                            conversation_uuid TEXT NOT NULL,
+                            source_channel_id INTEGER NOT NULL,
+                            source_message_id INTEGER NOT NULL,
+                            dest_channel_id INTEGER NOT NULL,
+                            relayed_message_id INTEGER NOT NULL,
+                            parent_uuid TEXT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            PRIMARY KEY (conversation_uuid, dest_channel_id, relayed_message_id)
+                        );
+                    """)
+                    await self._conn.execute("INSERT OR IGNORE INTO message_sync_v2 SELECT * FROM message_sync;")
+                    await self._conn.execute("DROP TABLE message_sync;")
+                    await self._conn.execute("ALTER TABLE message_sync_v2 RENAME TO message_sync;")
+        except Exception as e:
+            print(f"message_sync migration notice: {e}")
 
         await self._conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_source_msg ON message_sync(source_message_id);
@@ -259,15 +283,22 @@ class DatabaseManager:
             return (row[0], row[1]) if row else None
 
     async def prune_old_sync_records(self, days: int = 60) -> int:
-        """Deletes sync records older than given number of days to keep database lean."""
+        """Deletes sync records older than given number of days and prunes old translation cache to keep database lean."""
         if not self._conn:
             return 0
         async with self._conn.execute("""
             DELETE FROM message_sync 
             WHERE created_at < datetime('now', '-' || ? || ' days');
         """, (days,)) as cursor:
-            await self._conn.commit()
-            return cursor.rowcount
+            sync_deleted = cursor.rowcount
+
+        # Also clean up translation cache entries older than 90 days to prevent unbounded DB growth
+        await self._conn.execute("""
+            DELETE FROM translation_cache
+            WHERE created_at < datetime('now', '-90 days');
+        """)
+        await self._conn.commit()
+        return sync_deleted
 
     async def seed_common_translations(self):
         """Pre-seeds L2 cache with high-frequency verified Discord chat and gaming phrases."""

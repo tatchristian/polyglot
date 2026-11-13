@@ -168,3 +168,36 @@ async def test_seed_common_translations():
     assert ja_tr == "hello"
 
     await db.close()
+
+@pytest.mark.asyncio
+async def test_chunked_messages_preserve_all_relayed_ids():
+    """Verifies that multi-chunk messages sent to the same channel do not overwrite each other."""
+    db = DatabaseManager(db_path=":memory:")
+    await db.connect()
+
+    conv_uuid = "conv-long-chunked"
+    source_channel = 101
+    source_msg = 8000
+    # Two chunks delivered to dest channel 202
+    relays = [(202, 9001), (202, 9002)]
+
+    await db.record_relayed_messages(
+        conversation_uuid=conv_uuid,
+        source_channel_id=source_channel,
+        source_message_id=source_msg,
+        relays=relays
+    )
+
+    entries = await db.get_relayed_entries_by_source_id(source_msg)
+    # Both chunks must be preserved
+    assert len(entries) == 2
+    assert (202, 9001) in entries
+    assert (202, 9002) in entries
+
+    # Deleting source message should delete and return both chunks
+    deleted = await db.delete_entries_by_source_id(source_msg)
+    assert len(deleted) == 2
+    assert (202, 9001) in deleted
+    assert (202, 9002) in deleted
+
+    await db.close()

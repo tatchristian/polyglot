@@ -149,3 +149,33 @@ def test_ignore_privacy_opt_out_prefixes(relay_manager):
         msg.content = prefix
 
         assert relay_manager.should_process_message(msg) is False
+
+def test_spam_messages_ignored_by_relay(relay_manager):
+    channel_id = 123
+    relay_manager.channels[channel_id] = {"lang": "en", "is_romanized": False}
+
+    # 1. Keyboard smash / repeated character spam
+    msg_smash = MagicMock(spec=discord.Message)
+    msg_smash.author.bot = False
+    msg_smash.author.id = 777
+    msg_smash.webhook_id = None
+    msg_smash.channel = MagicMock(spec=discord.TextChannel)
+    msg_smash.channel.id = channel_id
+    msg_smash.content = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    msg_smash.attachments = []
+    assert relay_manager.should_process_message(msg_smash) is False
+
+    # 2. Duplicate spam in short burst
+    msg_dup = MagicMock(spec=discord.Message)
+    msg_dup.author.bot = False
+    msg_dup.author.id = 888
+    msg_dup.webhook_id = None
+    msg_dup.channel = MagicMock(spec=discord.TextChannel)
+    msg_dup.channel.id = channel_id
+    msg_dup.content = "check this out friends"
+    msg_dup.attachments = []
+
+    # First send is allowed
+    assert relay_manager.should_process_message(msg_dup) is True
+    # Immediate second identical send is blocked
+    assert relay_manager.should_process_message(msg_dup) is False

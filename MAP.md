@@ -43,7 +43,8 @@
 | File | Primary Responsibility | Key Classes / Functions | Depends On |
 | :--- | :--- | :--- | :--- |
 | **`bot.py`** | Bot bootstrap, Discord gateway events, slash commands (`/translate-add`, `/translate-remove`, `/translate-setup`, `/translate-doctor`, `/translate-status`), `View Original Text` context menu, flag emoji reactions, 60-day pruning task. | `bot`, `translate_setup()`, `translate_doctor()`, `view_original_text()`, `on_raw_reaction_add()` | `config`, `database`, `translator`, `relay` |
-| **`relay.py`** | Cross-channel fan-out, webhook lifecycle/caching, reply context localization, edit/delete synchronization, loop avoidance, `//` privacy opt-out prefix. | `WebhookRelayManager`, `LRUMessageMap`, `relay_message()`, `sync_edit()`, `sync_delete()` | `database`, `translator`, `hinglish_normalizer`, `hinglish_gatekeeper` |
+| **`relay.py`** | Cross-channel fan-out, webhook lifecycle/caching, reply context localization, edit/delete synchronization, loop avoidance, `//` privacy opt-out prefix. | `WebhookRelayManager`, `LRUMessageMap`, `relay_message()`, `sync_edit()`, `sync_delete()` | `database`, `translator`, `hinglish_normalizer`, `hinglish_gatekeeper`, `spam_filter` |
+| **`spam_filter.py`** | Anti-spam and meaningless message protection: duplicate bursts, keyboard smashes, repetitive word loops, newline bombs. | `AntiSpamManager`, `is_spam_or_meaningless()`, `is_meaningless_text()` | *Standard Library* |
 | **`translator.py`** | Multi-provider rotation, circuit breakers, 2-tier caching, syntax shielding for Discord markdown/mentions/emojis, message chunking (<2000 chars). | `TranslationService`, `CircuitBreaker`, `is_passthrough_text()`, `shield_syntax()`, `restore_syntax()`, `chunk_message()` | `config`, `database`, `hinglish_normalizer` |
 | **`database.py`** | Async SQLite persistence (`aiosqlite`) with WAL mode, channel mappings, conversation UUID tracking, L2 translation cache, 60-day sync pruning, and pre-seeded common phrase corpus. | `DatabaseManager`, `get_cached_translation()`, `set_cached_translation()`, `seed_common_translations()`, `prune_old_sync_records()` | `aiosqlite` |
 | **`hinglish_normalizer.py`** | Conversational Hinglish $\leftrightarrow$ English translation, multi-model failover (Groq $\to$ OpenRouter), whitespace collapsing, strict zero-cost `:free` tier enforcement. | `HinglishNormalizer`, `normalize_hinglish()`, `to_romanized_hindi()`, `translate_general()` | `config`, `groq`, `httpx` |
@@ -82,7 +83,7 @@ CREATE TABLE message_sync (
     relayed_message_id INTEGER NOT NULL,
     parent_uuid TEXT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (conversation_uuid, dest_channel_id)
+    PRIMARY KEY (conversation_uuid, dest_channel_id, relayed_message_id)
 );
 CREATE INDEX idx_source_msg ON message_sync(source_message_id);
 CREATE INDEX idx_relayed_msg ON message_sync(relayed_message_id);

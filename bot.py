@@ -67,9 +67,10 @@ FLAG_LANG_MAP = {
 
 @tasks.loop(hours=24)
 async def database_prune_task():
-    """Daily background task to prune message sync records older than 60 days."""
+    """Daily background task to prune message sync records older than 60 days and old cache."""
     try:
         deleted = await db_manager.prune_old_sync_records(days=60)
+        relay_manager.anti_spam.prune_old_state()
         if deleted > 0:
             print(f"🧹 Pruned {deleted} old sync records (>60 days old).")
     except Exception as e:
@@ -146,7 +147,10 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 @bot.event
 async def on_message(message: discord.Message):
-    await relay_manager.relay_message(message)
+    try:
+        await relay_manager.relay_message(message)
+    except Exception as e:
+        print(f"Relay error processing message {message.id}: {e}")
     await bot.process_commands(message)
 
 @bot.event

@@ -13,6 +13,7 @@ from translator import TranslationService, shield_syntax, restore_syntax, is_pas
 from database import DatabaseManager
 from hinglish_gatekeeper import is_potential_hinglish, is_already_english
 from hinglish_normalizer import HinglishNormalizer
+from spam_filter import AntiSpamManager
 
 class LRUMessageMap:
     """Bounded LRU cache for in-memory L1 lookup."""
@@ -52,6 +53,8 @@ class WebhookRelayManager:
         self.normalizer = HinglishNormalizer()
         self.translator.llm_service = self.normalizer
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_RELAYS)
+        self.message_lru = LRUMessageMap(maxsize=1000)
+        self.anti_spam = AntiSpamManager()
         self.webhooks: Dict[int, discord.Webhook] = {}
         # Dynamic channels dictionary: channel_id -> {"lang": str, "is_romanized": bool}
         self.channels: Dict[int, Dict[str, Any]] = {}
@@ -95,6 +98,17 @@ class WebhookRelayManager:
         has_forward = hasattr(message, "message_snapshots") and bool(message.message_snapshots)
         if not content and not message.attachments and not has_forward:
             return False
+
+        # Anti-Spam & Meaningless Message Protection
+        if content:
+            is_spam, reason = self.anti_spam.is_spam_or_meaningless(
+                author_id=message.author.id,
+                channel_id=message.channel.id,
+                text=content
+            )
+            if is_spam:
+                print(f"🛡️ Anti-spam blocked message from user {message.author.id} in channel {message.channel.id} (reason: {reason})")
+                return False
 
         return True
 
@@ -378,6 +392,7 @@ class WebhookRelayManager:
             await asyncio.gather(*delivery_tasks)
 
         if relayed_entries:
+            self.message_lru.put(message.id, relayed_entries)
             await self.db.record_relayed_messages(
                 conversation_uuid=conv_uuid,
                 source_channel_id=message.channel.id,
@@ -391,15 +406,24 @@ class WebhookRelayManager:
         if not self.should_process_message(after):
             return
 
-        relayed_entries = await self.db.get_relayed_entries_by_source_id(before.id)
+        relayed_entries = self.message_lru.get(before.id) or await self.db.get_relayed_entries_by_source_id(before.id)
         if not relayed_entries:
             return
 
         channel_info = self.channels[after.channel.id]
         source_lang = channel_info["lang"]
+        is_source_romanized = channel_info.get("is_romanized", False)
         updated_text = after.content.strip()
         if not updated_text:
             return
+
+        # Check if edited text in a Romanized channel is Hinglish requiring AI interpretation
+        normalized_english = None
+        if source_lang == "hi" and is_source_romanized:
+            shielded_input, in_tokens = shield_syntax(updated_text)
+            raw_normalized = await self.normalizer.normalize_hinglish(shielded_input)
+            if raw_normalized:
+                normalized_english = restore_syntax(raw_normalized, in_tokens)
 
         reply_author, raw_snippet, _ = await self._get_reply_context(after)
 
@@ -420,14 +444,26 @@ class WebhookRelayManager:
             is_target_romanized = dest_info.get("is_romanized", False)
 
             if target_lang == "hi" and is_target_romanized:
-                en_chunks = await self.translator.translate(
-                    text=updated_text,
-                    source_lang=source_lang,
-                    target_lang="en"
-                )
-                base_en = en_chunks[0] if en_chunks else updated_text
-                romanized = await self.normalizer.to_romanized_hindi(base_en)
-                chunks = [romanized] if romanized else [base_en]
+                base_en = normalized_english
+                if not base_en:
+                    en_chunks = await self.translator.translate(
+                        text=updated_text,
+                        source_lang=source_lang,
+                        target_lang="en"
+                    )
+                    base_en = en_chunks[0] if en_chunks else updated_text
+                shielded_en, en_tokens = shield_syntax(base_en)
+                romanized = await self.normalizer.to_romanized_hindi(shielded_en)
+                chunks = [restore_syntax(romanized, en_tokens)] if romanized else [base_en]
+            elif normalized_english:
+                if target_lang == "en":
+                    chunks = [normalized_english]
+                else:
+                    chunks = await self.translator.translate(
+                        text=normalized_english,
+                        source_lang="en",
+                        target_lang=target_lang
+                    )
             else:
                 chunks = await self.translator.translate(
                     text=updated_text,
@@ -467,6 +503,7 @@ class WebhookRelayManager:
 
     async def handle_message_delete(self, message: discord.Message):
         """Synchronizes message deletions to relayed webhook messages via SQLite records."""
+        self.message_lru.remove(message.id)
         relayed_entries = await self.db.delete_entries_by_source_id(message.id)
         if not relayed_entries:
             return
