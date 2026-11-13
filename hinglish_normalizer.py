@@ -130,6 +130,11 @@ class HinglishNormalizer:
         # 2. Try OpenRouter Free Pool if configured
         if self.openrouter_api_key:
             for model in self.openrouter_models:
+                # Absolute zero-cost guarantee: only invoke explicitly free models
+                if not model.endswith(":free"):
+                    print(f"Safety guard: Skipping non-free OpenRouter model '{model}' to guarantee $0 cost.")
+                    continue
+
                 try:
                     async with httpx.AsyncClient(timeout=5.0) as http_client:
                         res = await http_client.post(
