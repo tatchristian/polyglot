@@ -9,7 +9,7 @@ from config import (
     COMMAND_PREFIXES,
     MAX_CONCURRENT_RELAYS,
 )
-from translator import TranslationService
+from translator import TranslationService, shield_syntax, restore_syntax
 from database import DatabaseManager
 from hinglish_gatekeeper import is_potential_hinglish
 from hinglish_normalizer import HinglishNormalizer
@@ -52,11 +52,7 @@ class WebhookRelayManager:
         self.webhooks: Dict[int, discord.Webhook] = {}
         # Dynamic channels dictionary: channel_id -> {"lang": str, "is_romanized": bool}
         self.channels: Dict[int, Dict[str, Any]] = {}
-        self.safe_mentions = discord.AllowedMentions(
-            everyone=False,
-            roles=False,
-            users=True
-        )
+        self.safe_mentions = discord.AllowedMentions.none()
 
     async def sync_channel_cache(self):
         """Loads active channels and their Romanized settings from SQLite into memory."""
@@ -162,16 +158,29 @@ class WebhookRelayManager:
             parent_context = None
             if message.reference and message.reference.resolved:
                 parent_context = getattr(message.reference.resolved, "content", None)
-            normalized_english = await self.normalizer.normalize_hinglish(
-                text_to_translate,
+
+            # Shield mentions, emojis, and code tokens so AI doesn't mangle user IDs
+            shielded_input, in_tokens = shield_syntax(text_to_translate)
+            raw_normalized = await self.normalizer.normalize_hinglish(
+                shielded_input,
                 parent_context=parent_context
             )
+            if not raw_normalized and is_romanized_channel:
+                # Retry once without parent context if first attempt timed out
+                raw_normalized = await self.normalizer.normalize_hinglish(shielded_input)
+
+            if raw_normalized:
+                normalized_english = restore_syntax(raw_normalized, in_tokens)
 
         relayed_entries: List[Tuple[int, int]] = []
 
         async def deliver_to_channel(dest_id: int, dest_info: Dict[str, Any]):
             dest_channel = self.bot.get_channel(dest_id)
             if not isinstance(dest_channel, discord.TextChannel):
+                return
+
+            # Guild Isolation: Only relay within the same Discord server
+            if message.guild and dest_channel.guild.id != message.guild.id:
                 return
 
             target_lang = dest_info["lang"]
@@ -188,9 +197,10 @@ class WebhookRelayManager:
                         )
                         base_english = en_chunks[0] if en_chunks else text_to_translate
 
-                    romanized = await self.normalizer.to_romanized_hindi(base_english)
-                    if romanized:
-                        chunks = [romanized]
+                    shielded_en, en_tokens = shield_syntax(base_english)
+                    romanized_raw = await self.normalizer.to_romanized_hindi(shielded_en)
+                    if romanized_raw:
+                        chunks = [restore_syntax(romanized_raw, en_tokens)]
                     else:
                         chunks = await self.translator.translate(
                             text=base_english,
@@ -283,9 +293,12 @@ class WebhookRelayManager:
             if not dest_info:
                 return
 
-            target_lang = dest_info["lang"]
             dest_channel = self.bot.get_channel(dest_channel_id)
             if not isinstance(dest_channel, discord.TextChannel):
+                return
+
+            # Guild Isolation: Only relay within the same Discord server
+            if after.guild and dest_channel.guild.id != after.guild.id:
                 return
 
             if target_lang == "hi" and dest_info.get("is_romanized", False):
@@ -311,7 +324,7 @@ class WebhookRelayManager:
             wh = await self.get_or_create_webhook(dest_channel)
             async with self.semaphore:
                 try:
-                    await wh.edit_message(webhook_msg_id, content=content_to_send)
+                    await wh.edit_message(webhook_msg_id, content=content_to_send, allowed_mentions=self.safe_mentions)
                 except Exception as e:
                     print(f"Error updating edited message in #{dest_channel.name}: {e}")
 
@@ -332,6 +345,10 @@ class WebhookRelayManager:
         async def delete_single_channel(dest_channel_id: int, webhook_msg_id: int):
             dest_channel = self.bot.get_channel(dest_channel_id)
             if not isinstance(dest_channel, discord.TextChannel):
+                return
+
+            # Guild Isolation: Only relay within the same Discord server
+            if message.guild and dest_channel.guild.id != message.guild.id:
                 return
 
             wh = await self.get_or_create_webhook(dest_channel)

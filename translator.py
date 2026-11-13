@@ -21,9 +21,10 @@ from config import (
 EMOJI_PATTERN = re.compile(r"<a?:[a-zA-Z0-9_]+:[0-9]+>")
 CODE_BLOCK_PATTERN = re.compile(r"```[\s\S]*?```")
 INLINE_CODE_PATTERN = re.compile(r"`[^`\n]+`")
+MENTION_PATTERN = re.compile(r"<@[!&]?[0-9]+>|<#[0-9]+>")
 
 def shield_syntax(text: str) -> Tuple[str, Dict[str, str]]:
-    """Replaces custom emojis and code blocks with unique tokens before translation."""
+    """Replaces custom emojis, mentions, and code blocks with unique tokens before translation."""
     token_map: Dict[str, str] = {}
     counter = 0
 
@@ -48,9 +49,17 @@ def shield_syntax(text: str) -> Tuple[str, Dict[str, str]]:
         counter += 1
         return token
 
+    def replace_mention(match: re.Match) -> str:
+        nonlocal counter
+        token = f"__DISCORD_MENTION_{counter}__"
+        token_map[token] = match.group(0)
+        counter += 1
+        return token
+
     shielded = CODE_BLOCK_PATTERN.sub(replace_code_block, text)
     shielded = INLINE_CODE_PATTERN.sub(replace_inline_code, shielded)
     shielded = EMOJI_PATTERN.sub(replace_emoji, shielded)
+    shielded = MENTION_PATTERN.sub(replace_mention, shielded)
 
     return shielded, token_map
 

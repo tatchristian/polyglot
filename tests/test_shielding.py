@@ -40,3 +40,14 @@ def test_combined_syntax_shielding():
     assert len(tokens) == 3
     restored = restore_syntax(shielded, tokens)
     assert restored == original
+
+def test_mention_shielding():
+    original = "Hey <@123456789012345678> and <@!987654321098765432>, check <#112233445566778899> and <@&55667788>!"
+    shielded, tokens = shield_syntax(original)
+
+    assert "<@123456789012345678>" not in shielded
+    assert "<#112233445566778899>" not in shielded
+    assert len(tokens) == 4
+
+    restored = restore_syntax(shielded, tokens)
+    assert restored == original
