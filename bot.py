@@ -167,6 +167,7 @@ async def translate_status(interaction: discord.Interaction):
 
     stats_text = (
         f"• Total Translations: **{stats['total_translated']}**\n"
+        f"• Cache Hits (Zero-API Saved): **{stats.get('cache_hits', 0)}**\n"
         f"• DeepL: `{stats['deepl_success']}` | Azure: `{stats['azure_success']}`\n"
         f"• MyMemory: `{stats['mymemory_success']}` | Google: `{stats['google_success']}`\n"
         f"• LLM Cascading Failover: `{stats.get('llm_success', 0)}` (Multi-Model Pool)\n"

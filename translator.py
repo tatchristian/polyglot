@@ -2,6 +2,7 @@
 
 import re
 import asyncio
+from collections import OrderedDict
 from typing import List, Tuple, Dict, Optional, Callable
 from deep_translator import (
     GoogleTranslator,
@@ -122,13 +123,48 @@ MYMEMORY_LANG_MAP = {
     "uk": "ukrainian",
 }
 
-class TranslationService:
-    """Manages translation with automatic multi-provider fallback, LLM failover, and retry logic."""
+# Universal tokens that do not require translation (saves API quota)
+UNIVERSAL_TOKENS = {
+    "lol", "lmao", "rofl", "gg", "ggwp", "w", "l", "f", "idk", "afk", "brb",
+    "npc", "ping", "lag", "dc", "vc", "ok", "k", "ty", "thx", "pls", "plz",
+    "rip", "wip", "bruh", "xd", "ez", "glhf", "mb", "omg", "wtf"
+}
 
-    def __init__(self, llm_service=None):
+def is_passthrough_text(text: str) -> bool:
+    """Returns True if the text should bypass translation APIs (URLs, emojis, numbers, universal slang)."""
+    cleaned = text.strip()
+    if not cleaned:
+        return True
+
+    # 1. Pure URLs
+    if re.fullmatch(r"https?://\S+", cleaned, re.IGNORECASE):
+        return True
+
+    # 2. Pure Discord custom emojis or user/channel mentions
+    no_discord = re.sub(r"<a?:[a-zA-Z0-9_]+:[0-9]+>|<@[!&]?[0-9]+>|<#[0-9]+>", "", cleaned).strip()
+    if not no_discord:
+        return True
+
+    # 3. Pure numbers, punctuation, or unicode symbols/emojis
+    if not re.search(r"[a-zA-Z\u00C0-\u024F\u0400-\u04FF\u0600-\u06FF\u0900-\u097F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF]", cleaned):
+        return True
+
+    # 4. Universal single-word gaming/internet tokens
+    if cleaned.lower() in UNIVERSAL_TOKENS:
+        return True
+
+    return False
+
+class TranslationService:
+    """Manages translation with automatic multi-provider fallback, LRU caching, and LLM failover."""
+
+    def __init__(self, llm_service=None, cache_size: int = 2000):
         self.llm_service = llm_service
+        self.cache_size = cache_size
+        self._cache: OrderedDict[Tuple[str, str, str], str] = OrderedDict()
         self.stats = {
             "total_translated": 0,
+            "cache_hits": 0,
             "deepl_success": 0,
             "azure_success": 0,
             "mymemory_success": 0,
@@ -136,6 +172,23 @@ class TranslationService:
             "llm_success": 0,
             "errors": 0,
         }
+
+    def _get_from_cache(self, source_lang: str, target_lang: str, text: str) -> Optional[str]:
+        """Looks up a previously translated phrase from L1 LRU memory."""
+        key = (source_lang, target_lang, text.strip().lower())
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+
+    def _save_to_cache(self, source_lang: str, target_lang: str, text: str, translated: str):
+        """Stores translated phrase in bounded LRU memory."""
+        if not translated or not text or "*(All providers exhausted" in translated:
+            return
+        key = (source_lang, target_lang, text.strip().lower())
+        self._cache[key] = translated
+        if len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
 
     def _get_providers(self, source_lang: str, target_lang: str) -> List[Tuple[str, Callable[[str], str]]]:
         """Returns the ordered list of active translation providers."""
@@ -219,12 +272,23 @@ class TranslationService:
         source_lang: str,
         target_lang: str
     ) -> List[str]:
-        """Translates text asynchronously using thread execution with cascading LLM failover."""
+        """Translates text asynchronously with passthrough filtering, LRU caching, and cascading LLM failover."""
         if not text or not text.strip():
             return []
 
         if source_lang == target_lang:
             return chunk_message(text)
+
+        # 1. Passthrough Filter: URLs, emojis, numbers, and universal gaming acronyms bypass APIs
+        if is_passthrough_text(text):
+            return chunk_message(text)
+
+        # 2. L1 LRU Cache Check: Instant hit without consuming any API calls or tokens
+        cached = self._get_from_cache(source_lang, target_lang, text)
+        if cached:
+            self.stats["cache_hits"] += 1
+            self.stats["total_translated"] += 1
+            return chunk_message(cached)
 
         translated_text = None
         try:
@@ -257,11 +321,15 @@ class TranslationService:
                     restored = restore_syntax(llm_result, token_map)
                     self.stats["llm_success"] += 1
                     self.stats["total_translated"] += 1
+                    self._save_to_cache(source_lang, target_lang, text, restored)
                     return chunk_message(restored)
             except Exception as e:
                 print(f"LLM translation fallback error: {e}")
 
         if not translated_text:
             translated_text = text
+        elif not failed_traditional:
+            # Save successful traditional translation to cache
+            self._save_to_cache(source_lang, target_lang, text, translated_text)
 
         return chunk_message(translated_text)
