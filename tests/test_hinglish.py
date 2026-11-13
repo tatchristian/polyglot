@@ -64,3 +64,24 @@ async def test_to_romanized_hindi_success():
     result = await normalizer.to_romanized_hindi("What time is the tournament tomorrow?")
     assert result == "Kal tournament kitne baje hai?"
     assert normalizer.stats["groq_to_romanized"] == 1
+
+@pytest.mark.asyncio
+async def test_multi_model_failover_success():
+    normalizer = HinglishNormalizer(api_key="mock_key", groq_models=["model_1", "model_2"])
+
+    mock_chat = AsyncMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = "Success from model 2"
+    mock_response = MagicMock(choices=[mock_choice])
+
+    # First call (model_1) fails with RateLimit; second call (model_2) succeeds
+    mock_chat.completions.create.side_effect = [
+        Exception("Rate limit 429 on model_1"),
+        mock_response
+    ]
+    normalizer.client.chat = mock_chat
+
+    result = await normalizer.normalize_hinglish("bhai failover test")
+    assert result == "Success from model 2"
+    assert normalizer.stats["model_failovers"] == 1
+    assert normalizer.stats["groq_normalizations"] == 1

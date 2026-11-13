@@ -64,6 +64,30 @@ async def test_all_providers_fail():
         assert service.stats["errors"] == 1
 
 @pytest.mark.asyncio
+async def test_llm_failover_when_traditional_providers_fail():
+    from unittest.mock import AsyncMock
+    mock_llm = MagicMock()
+    mock_llm.translate_general = AsyncMock(return_value="Hola desde LLM Pool")
+    service = TranslationService(llm_service=mock_llm)
+
+    with patch("translator.MyMemoryTranslator") as mock_mm, \
+         patch("translator.GoogleTranslator") as mock_gt:
+
+        mm_inst = MagicMock()
+        mm_inst.translate.side_effect = Exception("MyMemory TooManyRequests")
+        mock_mm.return_value = mm_inst
+
+        gt_inst = MagicMock()
+        gt_inst.translate.side_effect = Exception("Google TooManyRequests")
+        mock_gt.return_value = gt_inst
+
+        result = await service.translate("Hello after rate limit", source_lang="en", target_lang="es")
+
+        assert result == ["Hola desde LLM Pool"]
+        assert service.stats["llm_success"] == 1
+        mock_llm.translate_general.assert_called_once()
+
+@pytest.mark.asyncio
 async def test_same_language_skips_all_providers():
     service = TranslationService()
 

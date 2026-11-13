@@ -123,15 +123,17 @@ MYMEMORY_LANG_MAP = {
 }
 
 class TranslationService:
-    """Manages translation with automatic multi-provider fallback and retry logic."""
+    """Manages translation with automatic multi-provider fallback, LLM failover, and retry logic."""
 
-    def __init__(self):
+    def __init__(self, llm_service=None):
+        self.llm_service = llm_service
         self.stats = {
             "total_translated": 0,
             "deepl_success": 0,
             "azure_success": 0,
             "mymemory_success": 0,
             "google_success": 0,
+            "llm_success": 0,
             "errors": 0,
         }
 
@@ -217,13 +219,14 @@ class TranslationService:
         source_lang: str,
         target_lang: str
     ) -> List[str]:
-        """Translates text asynchronously using thread execution."""
+        """Translates text asynchronously using thread execution with cascading LLM failover."""
         if not text or not text.strip():
             return []
 
         if source_lang == target_lang:
             return chunk_message(text)
 
+        translated_text = None
         try:
             translated_text = await asyncio.to_thread(
                 self._sync_translate,
@@ -231,7 +234,34 @@ class TranslationService:
                 source_lang,
                 target_lang
             )
-        except Exception as e:
-            translated_text = f"*(Translation runtime error: {type(e).__name__})* {text}"
+        except Exception:
+            translated_text = None
+
+        # Check if traditional providers were exhausted (e.g. TooManyRequests)
+        failed_traditional = (
+            not translated_text or
+            "*(All providers exhausted" in translated_text or
+            "*(Translation runtime error" in translated_text
+        )
+
+        if failed_traditional and self.llm_service:
+            # Shield text before passing to LLM to preserve Discord mentions and emojis
+            shielded_text, token_map = shield_syntax(text)
+            try:
+                llm_result = await self.llm_service.translate_general(
+                    text=shielded_text,
+                    source_lang=source_lang,
+                    target_lang=target_lang
+                )
+                if llm_result:
+                    restored = restore_syntax(llm_result, token_map)
+                    self.stats["llm_success"] += 1
+                    self.stats["total_translated"] += 1
+                    return chunk_message(restored)
+            except Exception as e:
+                print(f"LLM translation fallback error: {e}")
+
+        if not translated_text:
+            translated_text = text
 
         return chunk_message(translated_text)

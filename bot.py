@@ -169,6 +169,7 @@ async def translate_status(interaction: discord.Interaction):
         f"• Total Translations: **{stats['total_translated']}**\n"
         f"• DeepL: `{stats['deepl_success']}` | Azure: `{stats['azure_success']}`\n"
         f"• MyMemory: `{stats['mymemory_success']}` | Google: `{stats['google_success']}`\n"
+        f"• LLM Cascading Failover: `{stats.get('llm_success', 0)}` (Multi-Model Pool)\n"
         f"• Hinglish AI Detected: **{ai_stats['hinglish_detections']}** (Groq: `{ai_stats['groq_normalizations']}`)\n"
         f"• Total Synced Messages (DB): **{db_stats['total_synced_messages']}**\n"
         f"• Error Count: **{stats['errors']}**"

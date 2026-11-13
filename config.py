@@ -10,10 +10,26 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
 # Optional Provider API Keys for Cascading Failover & Intelligence
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "").strip()
 AZURE_TRANSLATOR_KEY = os.getenv("AZURE_TRANSLATOR_KEY", "").strip()
 AZURE_REGION = os.getenv("AZURE_REGION", "eastus").strip()
 MYMEMORY_EMAIL = os.getenv("MYMEMORY_EMAIL", "").strip()
+
+# Groq Model Pool with Automatic Cascading Failover
+GROQ_MODELS = [
+    "qwen/qwen3.8-27b",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+]
+
+# OpenRouter Free Fallback Models (activated when OPENROUTER_API_KEY is configured)
+OPENROUTER_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemini-2.0-flash:free",
+    "qwen/qwen-2.5-72b-instruct:free",
+]
 
 # Supported language codes mapped to their environment variable names
 LANGUAGE_CONFIG_KEYS = {

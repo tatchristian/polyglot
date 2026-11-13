@@ -1,12 +1,11 @@
-"""AI Normalizer and Romanizer for Hinglish using Groq Qwen 27B."""
+"""AI Normalizer, Romanizer, and General Translation Service using Groq and OpenRouter Model Pools."""
 
 import os
 import asyncio
-from typing import Optional
+from typing import Optional, List
+import httpx
 from groq import AsyncGroq
-from config import GROQ_API_KEY
-
-MODEL_NAME = "qwen/qwen3.8-27b"
+from config import GROQ_API_KEY, OPENROUTER_API_KEY, GROQ_MODELS, OPENROUTER_MODELS
 
 HINGLISH_TO_ENGLISH_PROMPT = """You are an elite bilingual translator specializing in Indian Discord chat, gaming banter, Hindi, and Hinglish slang.
 Your objective is to translate Hinglish (Hindi written in Roman/Latin script) OR Devanagari Hindi into NATURAL, IDIOMATIC, and CASUAL English as spoken in modern Discord gaming communities.
@@ -76,80 +75,149 @@ CRITICAL GRAMMAR & VOCABULARY RULES:
 """
 
 class HinglishNormalizer:
-    """Normalizes informal Hinglish into canonical English and generates Romanized Hindi output."""
+    """Normalizes informal Hinglish into canonical English, generates Romanized Hindi, and provides multi-model translation."""
 
-    def __init__(self, api_key: Optional[str] = GROQ_API_KEY):
+    def __init__(
+        self,
+        api_key: Optional[str] = GROQ_API_KEY,
+        openrouter_api_key: Optional[str] = OPENROUTER_API_KEY,
+        groq_models: Optional[List[str]] = None,
+        openrouter_models: Optional[List[str]] = None,
+    ):
         self.api_key = api_key
+        self.openrouter_api_key = openrouter_api_key
         self.client = AsyncGroq(api_key=api_key) if api_key else None
+        self.groq_models = groq_models or list(GROQ_MODELS)
+        self.openrouter_models = openrouter_models or list(OPENROUTER_MODELS)
         self.stats = {
             "hinglish_detections": 0,
             "groq_normalizations": 0,
             "groq_to_romanized": 0,
+            "llm_general_translations": 0,
             "groq_failures": 0,
+            "model_failovers": 0,
         }
+
+    async def _call_llm(
+        self,
+        messages: list,
+        temperature: float = 0.2,
+        max_tokens: int = 256
+    ) -> Optional[str]:
+        """Executes LLM completion across the Groq model pool, cascading to OpenRouter on quota/rate limits."""
+        # 1. Try Groq Model Pool
+        if self.client and self.api_key:
+            for model in self.groq_models:
+                try:
+                    response = await asyncio.wait_for(
+                        self.client.chat.completions.create(
+                            model=model,
+                            messages=messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                        ),
+                        timeout=4.0
+                    )
+                    result = response.choices[0].message.content.strip()
+                    if result.startswith('"') and result.endswith('"'):
+                        result = result[1:-1].strip()
+                    return result
+                except Exception as e:
+                    self.stats["model_failovers"] += 1
+                    print(f"Groq model '{model}' failed ({e}). Cascading to next model in pool...")
+                    continue
+
+        # 2. Try OpenRouter Free Pool if configured
+        if self.openrouter_api_key:
+            for model in self.openrouter_models:
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as http_client:
+                        res = await http_client.post(
+                            "https://openrouter.ai/api/v1/chat/completions",
+                            headers={
+                                "Authorization": f"Bearer {self.openrouter_api_key}",
+                                "HTTP-Referer": "https://github.com/tatchristian/polyglot",
+                                "X-Title": "Polyglot Discord Translator"
+                            },
+                            json={
+                                "model": model,
+                                "messages": messages,
+                                "temperature": temperature,
+                                "max_tokens": max_tokens,
+                            }
+                        )
+                        if res.status_code == 200:
+                            data = res.json()
+                            result = data["choices"][0]["message"]["content"].strip()
+                            if result.startswith('"') and result.endswith('"'):
+                                result = result[1:-1].strip()
+                            return result
+                        else:
+                            print(f"OpenRouter '{model}' returned status {res.status_code}. Cascading...")
+                except Exception as e:
+                    print(f"OpenRouter model '{model}' failed ({e}). Cascading...")
+                    continue
+
+        self.stats["groq_failures"] += 1
+        return None
 
     async def normalize_hinglish(
         self,
         text: str,
         parent_context: Optional[str] = None
     ) -> Optional[str]:
-        """Interprets Hinglish text into clean English using parent context."""
-        if not self.client or not self.api_key:
-            return None
-
+        """Interprets Hinglish text into clean English using parent context and cascading models."""
         user_content = text
         if parent_context and parent_context.strip():
             user_content = f"Context (in reply to): '{parent_context.strip()}'\nMessage to interpret: '{text}'"
 
-        try:
-            response = await asyncio.wait_for(
-                self.client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": HINGLISH_TO_ENGLISH_PROMPT},
-                        {"role": "user", "content": user_content}
-                    ],
-                    temperature=0.2,
-                    max_tokens=256,
-                ),
-                timeout=4.0
-            )
-            result = response.choices[0].message.content.strip()
-            if result.startswith('"') and result.endswith('"'):
-                result = result[1:-1].strip()
-
+        result = await self._call_llm(
+            messages=[
+                {"role": "system", "content": HINGLISH_TO_ENGLISH_PROMPT},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.2,
+            max_tokens=256
+        )
+        if result:
             self.stats["groq_normalizations"] += 1
-            return result
-        except Exception as e:
-            print(f"Hinglish normalization failed/timed out: {e}")
-            self.stats["groq_failures"] += 1
-            return None
+        return result
 
     async def to_romanized_hindi(self, text: str) -> Optional[str]:
         """Translates text into natural Romanized Hindi (Hinglish in English alphabet)."""
-        if not self.client or not self.api_key:
-            return None
-
-        try:
-            response = await asyncio.wait_for(
-                self.client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": ENGLISH_TO_HINGLISH_PROMPT},
-                        {"role": "user", "content": text}
-                    ],
-                    temperature=0.3,
-                    max_tokens=256,
-                ),
-                timeout=4.0
-            )
-            result = response.choices[0].message.content.strip()
-            if result.startswith('"') and result.endswith('"'):
-                result = result[1:-1].strip()
-
+        result = await self._call_llm(
+            messages=[
+                {"role": "system", "content": ENGLISH_TO_HINGLISH_PROMPT},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.3,
+            max_tokens=256
+        )
+        if result:
             self.stats["groq_to_romanized"] += 1
-            return result
-        except Exception as e:
-            print(f"Romanized Hindi generation failed/timed out: {e}")
-            self.stats["groq_failures"] += 1
-            return None
+        return result
+
+    async def translate_general(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str
+    ) -> Optional[str]:
+        """Translates general messages between any language pair using the LLM pool."""
+        system_prompt = (
+            f"You are a professional Discord chat translator. "
+            f"Translate the following text accurately and conversationally from language '{source_lang}' to '{target_lang}'. "
+            f"Preserve all Discord emojis, mentions (e.g. <@...>), channel tags, markdown, and gaming slang. "
+            f"Output ONLY the translated text without quotes or explanations."
+        )
+        result = await self._call_llm(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.2,
+            max_tokens=512
+        )
+        if result:
+            self.stats["llm_general_translations"] += 1
+        return result

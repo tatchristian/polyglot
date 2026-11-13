@@ -48,6 +48,7 @@ class WebhookRelayManager:
         self.translator = translator
         self.db = db
         self.normalizer = HinglishNormalizer()
+        self.translator.llm_service = self.normalizer
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_RELAYS)
         self.webhooks: Dict[int, discord.Webhook] = {}
         # Dynamic channels dictionary: channel_id -> {"lang": str, "is_romanized": bool}
