@@ -13,7 +13,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "").strip()
 AZURE_TRANSLATOR_KEY = os.getenv("AZURE_TRANSLATOR_KEY", "").strip()
-AZURE_REGION = os.getenv("AZURE_REGION", "eastus").strip()
+AZURE_REGION = os.getenv("AZURE_REGION", "westus2").strip()
 MYMEMORY_EMAIL = os.getenv("MYMEMORY_EMAIL", "").strip()
 
 # Groq Model Pool with Automatic Cascading Failover

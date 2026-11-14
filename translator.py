@@ -367,7 +367,7 @@ class TranslationService:
                     source_lang=source_lang,
                     target_lang=target_lang,
                     api_key=AZURE_TRANSLATOR_KEY,
-                    region=AZURE_REGION,
+                    region=AZURE_REGION or "westus2",
                     session=self.session
                 )
             ))
@@ -434,6 +434,7 @@ class TranslationService:
                     return restore_syntax(translated, token_map)
             except Exception as e:
                 last_error = e
+                print(f"⚠️ Provider '{name}' failed ({type(e).__name__}): {e}")
                 # Provider failed or rate-limited; trigger circuit breaker on 429
                 if _is_rate_limit_error(e):
                     if name in self.circuit_breakers:
