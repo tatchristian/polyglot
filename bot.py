@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from config import DISCORD_TOKEN, CHANNELS
-from translator import TranslationService
+from translator import TranslationService, shield_syntax, restore_syntax
 from relay import WebhookRelayManager
 from database import DatabaseManager
 
@@ -479,56 +479,42 @@ async def translate_status(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="translate-latency", description="Sends a live test message from any language and measures end-to-end latency.")
-@app_commands.choices(source_language=SUPPORTED_LANGUAGES, target_language=SUPPORTED_LANGUAGES)
+@bot.tree.command(name="translate-latency", description="Sends a live test message to any channel and measures translation, LLM, and webhook latency.")
 @app_commands.describe(
-    source_language="Source language (defaults to current channel's language or English)",
-    target_language="Target language (defaults to another registered channel or Spanish)",
-    target_channel="Channel to deliver the test webhook message to (optional)",
-    message="Custom message to test with (optional, defaults to standard language test phrase)"
+    target_channel="Channel to test delivery to (e.g. #hindi, #spanish, #japanese)",
+    message="Custom message to test with (optional, defaults to standard language test phrase)",
+    source_language="Source language (optional override, defaults to current channel)"
 )
+@app_commands.choices(source_language=SUPPORTED_LANGUAGES)
 async def translate_latency(
     interaction: discord.Interaction,
-    source_language: Optional[app_commands.Choice[str]] = None,
-    target_language: Optional[app_commands.Choice[str]] = None,
     target_channel: Optional[discord.TextChannel] = None,
-    message: Optional[str] = None
+    message: Optional[str] = None,
+    source_language: Optional[app_commands.Choice[str]] = None
 ):
-    """Sends a live benchmark message and records gateway, translation, and webhook delivery latency."""
+    """Sends a live benchmark message and records gateway, translation, LLM, and webhook delivery latency."""
     await interaction.response.defer(ephemeral=False)
     guild = interaction.guild
     if not guild:
         await interaction.followup.send("❌ This command must be used inside a Discord server.")
         return
 
-    # 1. Determine Source Language
+    # 1. Determine Source Channel & Language
+    src_info = relay_manager.channels.get(interaction.channel_id)
+    is_src_romanized = src_info.get("is_romanized", False) if src_info else False
     if source_language:
         src_lang = source_language.value
-    elif interaction.channel_id in relay_manager.channels:
-        src_lang = relay_manager.channels[interaction.channel_id]["lang"]
+    elif src_info:
+        src_lang = src_info["lang"]
     else:
         src_lang = "en"
 
-    # 2. Determine Target Language
-    if target_language:
-        tgt_lang = target_language.value
-    elif target_channel and target_channel.id in relay_manager.channels:
-        tgt_lang = relay_manager.channels[target_channel.id]["lang"]
-    else:
-        other_langs = [
-            info["lang"] for cid, info in relay_manager.channels.items()
-            if info["lang"] != src_lang and guild.get_channel(cid) is not None
-        ]
-        if other_langs:
-            tgt_lang = other_langs[0]
-        else:
-            tgt_lang = "es" if src_lang != "es" else "en"
-
-    # 3. Determine Destination Channel
+    # 2. Determine Destination Channel & Target Language
     dest_channel = target_channel
     if not dest_channel:
+        # Find another active channel in this server
         for cid, info in relay_manager.channels.items():
-            if info["lang"] == tgt_lang:
+            if cid != interaction.channel_id:
                 candidate = guild.get_channel(cid)
                 if isinstance(candidate, discord.TextChannel):
                     dest_channel = candidate
@@ -540,42 +526,98 @@ async def translate_latency(
         await interaction.followup.send("❌ Destination must be a valid text channel.")
         return
 
-    # 4. Determine Text to Test
+    dest_info = relay_manager.channels.get(dest_channel.id)
+    is_target_romanized = dest_info.get("is_romanized", False) if dest_info else False
+    if dest_info:
+        tgt_lang = dest_info["lang"]
+    else:
+        tgt_lang = "es" if src_lang != "es" else "en"
+
+    # 3. Determine Text to Test
     text_to_test = message.strip() if message and message.strip() else DEFAULT_TEST_PHRASES.get(src_lang, "Hello! Testing Polyglot real-time translation latency.")
 
-    # 5. Measure Translation Step
-    before_stats = translator_service.stats.copy()
-    t0 = time.perf_counter()
+    # 4. Measure Translation & LLM Pipeline
+    llm_ms = 0.0
+    translation_ms = 0.0
+    provider_name = ""
+    translated_text = text_to_test
+
     try:
-        chunks = await translator_service.translate(
-            text=text_to_test,
-            source_lang=src_lang,
-            target_lang=tgt_lang
-        )
+        # Case A: Delivering to a Romanized channel (e.g. #hindi) -> Requires Groq LLM Romanizer!
+        if tgt_lang == "hi" and is_target_romanized:
+            if src_lang == "en":
+                base_english = text_to_test
+            else:
+                t_tr0 = time.perf_counter()
+                en_chunks = await translator_service.translate(text_to_test, source_lang=src_lang, target_lang="en")
+                t_tr1 = time.perf_counter()
+                translation_ms = round((t_tr1 - t_tr0) * 1000, 2)
+                base_english = en_chunks[0] if en_chunks else text_to_test
+
+            shielded_en, en_tokens = shield_syntax(base_english)
+            t_llm0 = time.perf_counter()
+            romanized_raw = await relay_manager.normalizer.to_romanized_hindi(shielded_en)
+            t_llm1 = time.perf_counter()
+            llm_ms = round((t_llm1 - t_llm0) * 1000, 2)
+            translated_text = restore_syntax(romanized_raw, en_tokens) if romanized_raw else base_english
+            provider_name = f"🤖 Groq LPU AI Romanizer ({llm_ms} ms)"
+            if translation_ms > 0:
+                provider_name = f"🔷 Azure ({translation_ms} ms) ➔ 🤖 Groq LPU ({llm_ms} ms)"
+
+        # Case B: Sent from a Romanized channel (e.g. #hindi) -> Requires Groq LLM Normalizer!
+        elif src_lang == "hi" and is_src_romanized:
+            shielded_in, in_tokens = shield_syntax(text_to_test)
+            t_llm0 = time.perf_counter()
+            norm_en = await relay_manager.normalizer.normalize_hinglish(shielded_in)
+            t_llm1 = time.perf_counter()
+            llm_ms = round((t_llm1 - t_llm0) * 1000, 2)
+            normalized_english = restore_syntax(norm_en, in_tokens) if norm_en else text_to_test
+
+            if tgt_lang == "en":
+                translated_text = normalized_english
+                provider_name = f"🤖 Groq LPU AI Normalizer ({llm_ms} ms)"
+            else:
+                t_tr0 = time.perf_counter()
+                chunks = await translator_service.translate(normalized_english, source_lang="en", target_lang=tgt_lang)
+                t_tr1 = time.perf_counter()
+                translation_ms = round((t_tr1 - t_tr0) * 1000, 2)
+                translated_text = chunks[0] if chunks else normalized_english
+                provider_name = f"🤖 Groq LPU ({llm_ms} ms) ➔ 🔷 Azure ({translation_ms} ms)"
+
+        # Case C: Standard Translation Cascade (Azure -> MyMemory -> Google gtx)
+        else:
+            before_stats = translator_service.stats.copy()
+            t0 = time.perf_counter()
+            chunks = await translator_service.translate(
+                text=text_to_test,
+                source_lang=src_lang,
+                target_lang=tgt_lang
+            )
+            t1 = time.perf_counter()
+            translation_ms = round((t1 - t0) * 1000, 2)
+            translated_text = chunks[0] if chunks else text_to_test
+
+            # Identify Which Provider Answered
+            if translator_service.stats["cache_hits"] > before_stats["cache_hits"]:
+                provider_name = "⚡ L1/L2 Cache (0 ms computation)"
+            elif translator_service.stats["azure_success"] > before_stats["azure_success"]:
+                provider_name = "🔷 Azure AI Translator (westus2, Keep-Alive)"
+            elif translator_service.stats["deepl_success"] > before_stats["deepl_success"]:
+                provider_name = "🟧 DeepL Free API"
+            elif translator_service.stats["mymemory_success"] > before_stats["mymemory_success"]:
+                provider_name = "🟪 MyMemory API"
+            elif translator_service.stats["google_success"] > before_stats["google_success"]:
+                provider_name = "🌐 Google Public Client (client=gtx)"
+            elif translator_service.stats.get("llm_success", 0) > before_stats.get("llm_success", 0):
+                provider_name = "🤖 Groq / OpenRouter AI Pool"
+            else:
+                provider_name = "Passthrough / Same Language"
+
     except Exception as e:
-        await interaction.followup.send(f"❌ Translation engine error: `{e}`")
+        await interaction.followup.send(f"❌ Translation / LLM engine error: `{e}`")
         return
-    t1 = time.perf_counter()
-    translation_ms = round((t1 - t0) * 1000, 2)
-    translated_text = chunks[0] if chunks else text_to_test
 
-    # Identify Which Provider Answered
-    if translator_service.stats["cache_hits"] > before_stats["cache_hits"]:
-        provider_name = "⚡ L1/L2 Cache (0 ms computation)"
-    elif translator_service.stats["azure_success"] > before_stats["azure_success"]:
-        provider_name = "🔷 Azure AI Translator (westus2, Keep-Alive)"
-    elif translator_service.stats["deepl_success"] > before_stats["deepl_success"]:
-        provider_name = "🟧 DeepL Free API"
-    elif translator_service.stats["mymemory_success"] > before_stats["mymemory_success"]:
-        provider_name = "🟪 MyMemory API"
-    elif translator_service.stats["google_success"] > before_stats["google_success"]:
-        provider_name = "🌐 Google Public Client (client=gtx)"
-    elif translator_service.stats.get("llm_success", 0) > before_stats.get("llm_success", 0):
-        provider_name = "🤖 Groq / OpenRouter AI Pool"
-    else:
-        provider_name = "Passthrough / Same Language"
-
-    # 6. Measure Webhook Delivery Step
+    # 5. Measure Webhook Delivery Step
     try:
         wh = await relay_manager.get_or_create_webhook(dest_channel)
         t2 = time.perf_counter()
@@ -586,9 +628,10 @@ async def translate_latency(
             else:
                 avatar_url = bot.user.display_avatar.url
 
+        mode_badge = " [AI Romanized]" if is_target_romanized else ""
         sent_msg = await wh.send(
             content=f"⚡ **[Latency Benchmark]** {translated_text}",
-            username=f"Polyglot Ping [{src_lang.upper()} ➔ {tgt_lang.upper()}]",
+            username=f"Polyglot Ping [{src_lang.upper()} ➔ {tgt_lang.upper()}]{mode_badge}",
             avatar_url=avatar_url,
             allowed_mentions=discord.AllowedMentions.none(),
             wait=True
@@ -599,11 +642,12 @@ async def translate_latency(
         await interaction.followup.send(f"❌ Webhook delivery error in {dest_channel.mention}: `{e}`")
         return
 
-    # 7. Total End-to-End Latency
+    # 6. Total End-to-End Latency
     gateway_ms = round(bot.latency * 1000, 1)
-    total_pipeline_ms = round(translation_ms + webhook_ms, 2)
+    compute_ms = round(translation_ms + llm_ms, 2)
+    total_pipeline_ms = round(compute_ms + webhook_ms, 2)
 
-    # 8. Scorecard Performance Rating & Color
+    # 7. Scorecard Performance Rating & Color
     if total_pipeline_ms < 350:
         embed_color = 0x2ECC71  # Emerald Green
         perf_badge = "🚀 Ultra-Fast (Near Platform Floor)"
@@ -620,19 +664,26 @@ async def translate_latency(
         color=embed_color
     )
 
+    breakdown_lines = [
+        f"• 🚀 **Total End-to-End**: `{total_pipeline_ms} ms`"
+    ]
+    if llm_ms > 0:
+        breakdown_lines.append(f"• 🤖 **Groq LPU LLM Time**: `{llm_ms} ms`")
+    if translation_ms > 0:
+        breakdown_lines.append(f"• ⚡ **Azure Translation**: `{translation_ms} ms`")
+    breakdown_lines.extend([
+        f"• 📤 **Discord Webhook (`wh.send`)**: `{webhook_ms} ms`",
+        f"• 📡 **Gateway WebSocket Ping**: `{gateway_ms} ms`"
+    ])
+
     embed.add_field(
         name="📊 Latency Breakdown",
-        value=(
-            f"• 🚀 **Total End-to-End**: `{total_pipeline_ms} ms`\n"
-            f"• ⚡ **Translation Engine**: `{translation_ms} ms`\n"
-            f"• 📤 **Discord Webhook (`wh.send`)**: `{webhook_ms} ms`\n"
-            f"• 📡 **Gateway WebSocket Ping**: `{gateway_ms} ms`"
-        ),
+        value="\n".join(breakdown_lines),
         inline=False
     )
 
     embed.add_field(
-        name="🌐 Active Translation Provider",
+        name="🌐 Active Pipeline Provider",
         value=f"**{provider_name}**",
         inline=False
     )
@@ -643,8 +694,9 @@ async def translate_latency(
         inline=False
     )
 
+    dest_roman_str = " *(AI Romanized)*" if is_target_romanized else ""
     embed.add_field(
-        name=f"🎯 Relayed Webhook [{tgt_lang.upper()}]",
+        name=f"🎯 Relayed Webhook [{tgt_lang.upper()}]{dest_roman_str}",
         value=f"```{translated_text}```\nDelivered to: {dest_channel.mention} • [Jump to Message]({sent_msg.jump_url})",
         inline=False
     )
@@ -652,15 +704,18 @@ async def translate_latency(
     embed.set_footer(text="Polyglot Latency Diagnostic • Platform floor is ~350ms")
     await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="translate-ping", description="Quick shortcut to test translation and webhook relay latency.")
-@app_commands.choices(source_language=SUPPORTED_LANGUAGES, target_language=SUPPORTED_LANGUAGES)
+@bot.tree.command(name="translate-ping", description="Quick shortcut to benchmark relay, LLM, and webhook latency to any channel.")
+@app_commands.describe(
+    target_channel="Channel to test delivery to (e.g. #hindi, #spanish, #japanese)",
+    message="Custom message to test with (optional)"
+)
 async def translate_ping(
     interaction: discord.Interaction,
-    source_language: Optional[app_commands.Choice[str]] = None,
-    target_language: Optional[app_commands.Choice[str]] = None
+    target_channel: Optional[discord.TextChannel] = None,
+    message: Optional[str] = None
 ):
-    """Shortcut command calling translate_latency."""
-    await translate_latency.callback(interaction, source_language=source_language, target_language=target_language)
+    """Shortcut command calling translate_latency with target_channel."""
+    await translate_latency.callback(interaction, target_channel=target_channel, message=message)
 
 async def setup_bot():
     """Initializes command trees and event loops."""

@@ -55,8 +55,6 @@ async def test_translate_latency_execution():
         # Test execution
         await translate_latency.callback(
             interaction=interaction,
-            source_language=None,
-            target_language=None,
             target_channel=dest_channel,
             message="Hello! Testing latency."
         )
@@ -73,3 +71,53 @@ async def test_translate_latency_execution():
         assert "Polyglot Live Latency Benchmark" in embed.title
         assert "Total End-to-End" in embed.fields[0].value
         assert "Azure AI Translator" in embed.fields[1].value
+
+@pytest.mark.asyncio
+async def test_translate_latency_romanized_channel_execution():
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    interaction.channel_id = 1001
+
+    guild = MagicMock(spec=discord.Guild)
+    interaction.guild = guild
+
+    # Setup Romanized destination channel (#hindi)
+    hindi_channel = MagicMock(spec=discord.TextChannel)
+    hindi_channel.id = 1003
+    hindi_channel.mention = "<#1003>"
+    guild.get_channel.return_value = hindi_channel
+
+    wh_mock = MagicMock()
+    sent_msg = MagicMock()
+    sent_msg.jump_url = "https://discord.com/channels/123/1003/888"
+    wh_mock.send = AsyncMock(return_value=sent_msg)
+
+    with patch("bot.relay_manager") as mock_relay, \
+         patch("bot.translator_service") as mock_translator, \
+         patch("bot.bot") as mock_bot:
+
+        mock_bot.latency = 0.040
+        mock_bot.user.display_avatar.url = "https://example.com/bot.png"
+        mock_relay.channels = {
+            1001: {"lang": "en", "is_romanized": False},
+            1003: {"lang": "hi", "is_romanized": True}
+        }
+        mock_relay.get_or_create_webhook = AsyncMock(return_value=wh_mock)
+        mock_relay.normalizer.to_romanized_hindi = AsyncMock(return_value="Bro kya scene hai?")
+
+        # Test execution to Romanized channel
+        await translate_latency.callback(
+            interaction=interaction,
+            target_channel=hindi_channel,
+            message="Bro what's the plan?"
+        )
+
+        wh_mock.send.assert_called_once()
+        send_kwargs = wh_mock.send.call_args.kwargs
+        assert "Bro kya scene hai?" in send_kwargs["content"]
+        assert "[AI Romanized]" in send_kwargs["username"]
+
+        embed = interaction.followup.send.call_args.kwargs["embed"]
+        assert "Groq LPU AI Romanizer" in embed.fields[1].value
+        assert "Groq LPU LLM Time" in embed.fields[0].value
