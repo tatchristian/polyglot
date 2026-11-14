@@ -2,6 +2,7 @@
 
 import time
 import asyncio
+from typing import Optional, List, Dict, Any
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -63,6 +64,29 @@ FLAG_LANG_MAP = {
     "🇺🇦": "uk",
     "🇸🇦": "ar",
     "🇮🇩": "id"
+}
+
+DEFAULT_TEST_PHRASES = {
+    "en": "Hello! Testing Polyglot real-time translation latency.",
+    "es": "¡Hola! Probando la latencia de traducción en tiempo real de Polyglot.",
+    "ja": "こんにちは！Polyglotのリアルタイム翻訳レイテンシをテストしています。",
+    "hi": "नमस्ते! Polyglot रीयल-टाइम अनुवाद लेटेंसी का परीक्षण कर रहा है।",
+    "ko": "안녕하세요! Polyglot 실시간 번역 대기 시간을 테스트하고 있습니다.",
+    "fr": "Bonjour! Test de la latence de traduction en temps réel de Polyglot.",
+    "de": "Hallo! Testen der Polyglot-Echtzeit-Übersetzungslatenz.",
+    "pt": "Olá! Testando a latência de tradução em tempo real do Polyglot.",
+    "zh": "你好！正在测试Polyglot实时翻译延迟。",
+    "ru": "Привет! Тестирование задержки перевода в реальном времени Polyglot.",
+    "it": "Ciao! Test della latenza di traduzione in tempo reale di Polyglot.",
+    "ar": "مرحباً! اختبار زمن استجابة الترجمة الفورية لـ Polyglot.",
+    "id": "Halo! Menguji latensi terjemahan waktu nyata Polyglot.",
+    "vi": "Xin chào! Đang kiểm tra độ trễ dịch thời gian thực của Polyglot.",
+    "th": "สวัสดี! กำลังทดสอบเวลาแฝงในการแปลแบบเรียลไทม์ของ Polyglot",
+    "tl": "Kumusta! Sinusubukan ang real-time translation latency ng Polyglot.",
+    "tr": "Merhaba! Polyglot gerçek zamanlı çeviri gecikmesi test ediliyor.",
+    "pl": "Cześć! Testowanie opóźnienia tłumaczenia w czasie rzeczywistym Polyglot.",
+    "nl": "Hallo! Polyglot real-time vertaalvertraging testen.",
+    "uk": "Привіт! Тестування затримки перекладу в реальному часі Polyglot.",
 }
 
 @tasks.loop(hours=24)
@@ -449,6 +473,182 @@ async def translate_status(interaction: discord.Interaction):
     embed.set_footer(text="Polyglot Discord Translation Engine • v2.0")
 
     await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="translate-latency", description="Sends a live test message from any language and measures end-to-end latency.")
+@app_commands.choices(source_language=SUPPORTED_LANGUAGES, target_language=SUPPORTED_LANGUAGES)
+@app_commands.describe(
+    source_language="Source language (defaults to current channel's language or English)",
+    target_language="Target language (defaults to another registered channel or Spanish)",
+    target_channel="Channel to deliver the test webhook message to (optional)",
+    message="Custom message to test with (optional, defaults to standard language test phrase)"
+)
+async def translate_latency(
+    interaction: discord.Interaction,
+    source_language: Optional[app_commands.Choice[str]] = None,
+    target_language: Optional[app_commands.Choice[str]] = None,
+    target_channel: Optional[discord.TextChannel] = None,
+    message: Optional[str] = None
+):
+    """Sends a live benchmark message and records gateway, translation, and webhook delivery latency."""
+    await interaction.response.defer(ephemeral=False)
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send("❌ This command must be used inside a Discord server.")
+        return
+
+    # 1. Determine Source Language
+    if source_language:
+        src_lang = source_language.value
+    elif interaction.channel_id in relay_manager.channels:
+        src_lang = relay_manager.channels[interaction.channel_id]["lang"]
+    else:
+        src_lang = "en"
+
+    # 2. Determine Target Language
+    if target_language:
+        tgt_lang = target_language.value
+    elif target_channel and target_channel.id in relay_manager.channels:
+        tgt_lang = relay_manager.channels[target_channel.id]["lang"]
+    else:
+        other_langs = [
+            info["lang"] for cid, info in relay_manager.channels.items()
+            if info["lang"] != src_lang and guild.get_channel(cid) is not None
+        ]
+        if other_langs:
+            tgt_lang = other_langs[0]
+        else:
+            tgt_lang = "es" if src_lang != "es" else "en"
+
+    # 3. Determine Destination Channel
+    dest_channel = target_channel
+    if not dest_channel:
+        for cid, info in relay_manager.channels.items():
+            if info["lang"] == tgt_lang:
+                candidate = guild.get_channel(cid)
+                if isinstance(candidate, discord.TextChannel):
+                    dest_channel = candidate
+                    break
+    if not dest_channel:
+        dest_channel = interaction.channel
+
+    if not isinstance(dest_channel, discord.TextChannel):
+        await interaction.followup.send("❌ Destination must be a valid text channel.")
+        return
+
+    # 4. Determine Text to Test
+    text_to_test = message.strip() if message and message.strip() else DEFAULT_TEST_PHRASES.get(src_lang, "Hello! Testing Polyglot real-time translation latency.")
+
+    # 5. Measure Translation Step
+    before_stats = translator_service.stats.copy()
+    t0 = time.perf_counter()
+    try:
+        chunks = await translator_service.translate(
+            text=text_to_test,
+            source_lang=src_lang,
+            target_lang=tgt_lang
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ Translation engine error: `{e}`")
+        return
+    t1 = time.perf_counter()
+    translation_ms = round((t1 - t0) * 1000, 2)
+    translated_text = chunks[0] if chunks else text_to_test
+
+    # Identify Which Provider Answered
+    if translator_service.stats["cache_hits"] > before_stats["cache_hits"]:
+        provider_name = "⚡ L1/L2 Cache (0 ms computation)"
+    elif translator_service.stats["azure_success"] > before_stats["azure_success"]:
+        provider_name = "🔷 Azure AI Translator (westus2, Keep-Alive)"
+    elif translator_service.stats["deepl_success"] > before_stats["deepl_success"]:
+        provider_name = "🟧 DeepL Free API"
+    elif translator_service.stats["mymemory_success"] > before_stats["mymemory_success"]:
+        provider_name = "🟪 MyMemory API"
+    elif translator_service.stats["google_success"] > before_stats["google_success"]:
+        provider_name = "🌐 Google Public Client (client=gtx)"
+    elif translator_service.stats.get("llm_success", 0) > before_stats.get("llm_success", 0):
+        provider_name = "🤖 Groq / OpenRouter AI Pool"
+    else:
+        provider_name = "Passthrough / Same Language"
+
+    # 6. Measure Webhook Delivery Step
+    try:
+        wh = await relay_manager.get_or_create_webhook(dest_channel)
+        t2 = time.perf_counter()
+        sent_msg = await wh.send(
+            content=f"⚡ **[Latency Benchmark]** {translated_text}",
+            username=f"Polyglot Ping [{src_lang.upper()} ➔ {tgt_lang.upper()}]",
+            avatar_url=bot.user.display_avatar.url if bot.user else None,
+            allowed_mentions=discord.AllowedMentions.none(),
+            wait=True
+        )
+        t3 = time.perf_counter()
+        webhook_ms = round((t3 - t2) * 1000, 2)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Webhook delivery error in {dest_channel.mention}: `{e}`")
+        return
+
+    # 7. Total End-to-End Latency
+    gateway_ms = round(bot.latency * 1000, 1)
+    total_pipeline_ms = round(translation_ms + webhook_ms, 2)
+
+    # 8. Scorecard Performance Rating & Color
+    if total_pipeline_ms < 350:
+        embed_color = 0x2ECC71  # Emerald Green
+        perf_badge = "🚀 Ultra-Fast (Near Platform Floor)"
+    elif total_pipeline_ms < 600:
+        embed_color = 0x3498DB  # Blue
+        perf_badge = "⚡ Fast & Responsive"
+    else:
+        embed_color = 0xF1C40F  # Amber
+        perf_badge = "⏳ Normal / Slight Network Jitter"
+
+    embed = discord.Embed(
+        title="⏱️ Polyglot Live Latency Benchmark",
+        description=f"Performance rating: **{perf_badge}**",
+        color=embed_color
+    )
+
+    embed.add_field(
+        name="📊 Latency Breakdown",
+        value=(
+            f"• 🚀 **Total End-to-End**: `{total_pipeline_ms} ms`\n"
+            f"• ⚡ **Translation Engine**: `{translation_ms} ms`\n"
+            f"• 📤 **Discord Webhook (`wh.send`)**: `{webhook_ms} ms`\n"
+            f"• 📡 **Gateway WebSocket Ping**: `{gateway_ms} ms`"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🌐 Active Translation Provider",
+        value=f"**{provider_name}**",
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"📝 Source Message [{src_lang.upper()}]",
+        value=f"```{text_to_test}```",
+        inline=False
+    )
+
+    embed.add_field(
+        name=f"🎯 Relayed Webhook [{tgt_lang.upper()}]",
+        value=f"```{translated_text}```\nDelivered to: {dest_channel.mention} • [Jump to Message]({sent_msg.jump_url})",
+        inline=False
+    )
+
+    embed.set_footer(text="Polyglot Latency Diagnostic • Platform floor is ~350ms")
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="translate-ping", description="Quick shortcut to test translation and webhook relay latency.")
+@app_commands.choices(source_language=SUPPORTED_LANGUAGES, target_language=SUPPORTED_LANGUAGES)
+async def translate_ping(
+    interaction: discord.Interaction,
+    source_language: Optional[app_commands.Choice[str]] = None,
+    target_language: Optional[app_commands.Choice[str]] = None
+):
+    """Shortcut command calling translate_latency."""
+    await translate_latency.callback(interaction, source_language=source_language, target_language=target_language)
 
 async def setup_bot():
     """Initializes command trees and event loops."""
