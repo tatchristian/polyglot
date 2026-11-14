@@ -368,7 +368,10 @@ class WebhookRelayManager:
                     chunks = [attachment_text.strip()]
 
             wh = await self.get_or_create_webhook(dest_channel)
-            author_avatar = message.author.display_avatar.url
+            if hasattr(message.author.display_avatar, "with_size"):
+                author_avatar = message.author.display_avatar.with_size(64).url
+            else:
+                author_avatar = message.author.display_avatar.url
 
             async with self.semaphore:
                 for chunk in chunks:

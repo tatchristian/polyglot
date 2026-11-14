@@ -119,8 +119,13 @@ async def on_ready():
         lang = info["lang"].upper()
         mode = " [AI Romanized]" if info.get("is_romanized") else ""
         if isinstance(channel, discord.TextChannel):
-            await relay_manager.get_or_create_webhook(channel)
-            print(f"   • #{channel.name} [{lang}]{mode} -> Webhook Ready")
+            wh = await relay_manager.get_or_create_webhook(channel)
+            try:
+                # Pre-warm TLS connection pool to Discord webhook edge
+                await wh.fetch(prefer_auth=False)
+                print(f"   • #{channel.name} [{lang}]{mode} -> Webhook Ready & Pre-Warmed")
+            except Exception:
+                print(f"   • #{channel.name} [{lang}]{mode} -> Webhook Ready")
         else:
             print(f"   • Channel ID {channel_id} [{lang}]{mode} -> Not cached or not TextChannel")
 
@@ -574,10 +579,17 @@ async def translate_latency(
     try:
         wh = await relay_manager.get_or_create_webhook(dest_channel)
         t2 = time.perf_counter()
+        avatar_url = None
+        if bot.user:
+            if hasattr(bot.user.display_avatar, "with_size"):
+                avatar_url = bot.user.display_avatar.with_size(64).url
+            else:
+                avatar_url = bot.user.display_avatar.url
+
         sent_msg = await wh.send(
             content=f"⚡ **[Latency Benchmark]** {translated_text}",
             username=f"Polyglot Ping [{src_lang.upper()} ➔ {tgt_lang.upper()}]",
-            avatar_url=bot.user.display_avatar.url if bot.user else None,
+            avatar_url=avatar_url,
             allowed_mentions=discord.AllowedMentions.none(),
             wait=True
         )
