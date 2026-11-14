@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 from deep_translator.exceptions import TooManyRequests
-from translator import TranslationService, googleapis_translate
+from translator import TranslationService, googleapis_translate, azure_translate
 
 @pytest.mark.asyncio
 async def test_mymemory_success_when_no_keys():
@@ -104,11 +104,7 @@ async def test_azure_translator_success_when_key_configured():
 
     with patch("translator.AZURE_TRANSLATOR_KEY", "fake_azure_key"), \
          patch("translator.AZURE_REGION", "westus2"), \
-         patch("translator.MicrosoftTranslator") as mock_ms:
-
-        ms_inst = MagicMock()
-        ms_inst.translate.return_value = "Hola desde Azure"
-        mock_ms.return_value = ms_inst
+         patch("translator.azure_translate", return_value="Hola desde Azure") as mock_azure:
 
         result = await service.translate("Hello Azure", source_lang="en", target_lang="es")
 
@@ -122,13 +118,8 @@ async def test_azure_failover_to_mymemory_on_rate_limit():
 
     with patch("translator.AZURE_TRANSLATOR_KEY", "fake_azure_key"), \
          patch("translator.AZURE_REGION", "westus2"), \
-         patch("translator.MicrosoftTranslator") as mock_ms, \
+         patch("translator.azure_translate", side_effect=TooManyRequests("Azure 429 TooManyRequests")) as mock_azure, \
          patch("translator.MyMemoryTranslator") as mock_mm:
-
-        # Azure fails with rate limit / error
-        ms_inst = MagicMock()
-        ms_inst.translate.side_effect = Exception("Azure 429 TooManyRequests")
-        mock_ms.return_value = ms_inst
 
         # MyMemory succeeds
         mm_inst = MagicMock()
@@ -141,6 +132,25 @@ async def test_azure_failover_to_mymemory_on_rate_limit():
         assert service.stats["azure_success"] == 0
         assert service.stats["mymemory_success"] == 1
         assert service.circuit_breakers["azure"].is_healthy is False
+
+def test_azure_translate_json_parsing_and_429():
+    # 1. Test successful parsing
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = [{"translations": [{"text": "Hola mundo", "to": "es"}]}]
+
+    mock_session = MagicMock()
+    mock_session.post.return_value = mock_resp
+
+    res = azure_translate("Hello world", "en", "es", api_key="test_key", region="westus2", session=mock_session)
+    assert res == "Hola mundo"
+
+    # 2. Test 429 raises TooManyRequests
+    mock_429 = MagicMock()
+    mock_429.status_code = 429
+    mock_session.post.return_value = mock_429
+    with pytest.raises(TooManyRequests):
+        azure_translate("Hello world", "en", "es", api_key="test_key", region="westus2", session=mock_session)
 
 def test_googleapis_translate_json_parsing_and_429():
     # 1. Test successful parsing

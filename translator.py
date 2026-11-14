@@ -10,7 +10,6 @@ from typing import List, Tuple, Dict, Optional, Callable
 from deep_translator import (
     MyMemoryTranslator,
     DeeplTranslator,
-    MicrosoftTranslator,
 )
 from deep_translator.exceptions import TooManyRequests
 from config import (
@@ -169,8 +168,60 @@ def is_passthrough_text(text: str) -> bool:
 
     return False
 
-def googleapis_translate(text: str, source_lang: str, target_lang: str, timeout: float = 5.0) -> str:
-    """Translates text via Google's public translation endpoint (client=gtx) with JSON parsing and timeout."""
+def azure_translate(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    api_key: Optional[str] = None,
+    region: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+    timeout: float = 5.0
+) -> str:
+    """Translates text via Microsoft Azure Cognitive Services Translator using a persistent HTTP Keep-Alive session."""
+    if not text or not text.strip():
+        return text
+
+    key = api_key or AZURE_TRANSLATOR_KEY
+    if not key:
+        raise ValueError("Azure Translator key not configured")
+
+    reg = region or AZURE_REGION or "westus2"
+    url = "https://api.cognitive.microsofttranslator.com/translate"
+    params = {
+        "api-version": "3.0",
+        "from": source_lang,
+        "to": target_lang
+    }
+    headers = {
+        "Ocp-Apim-Subscription-Key": key,
+        "Ocp-Apim-Subscription-Region": reg,
+        "Content-Type": "application/json",
+        "User-Agent": "PolyglotDiscordBot/2.0"
+    }
+
+    client = session if session is not None else requests
+    try:
+        r = client.post(url, params=params, headers=headers, json=[{"text": text}], timeout=timeout)
+    except Exception as e:
+        raise e
+
+    if r.status_code == 429:
+        raise TooManyRequests("Azure 429 Too Many Requests")
+    r.raise_for_status()
+
+    data = r.json()
+    if isinstance(data, list) and data and "translations" in data[0]:
+        return data[0]["translations"][0]["text"]
+    return text
+
+def googleapis_translate(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    session: Optional[requests.Session] = None,
+    timeout: float = 5.0
+) -> str:
+    """Translates text via Google's public translation endpoint (client=gtx) with JSON parsing, session reuse, and timeout."""
     if not text or not text.strip():
         return text
 
@@ -186,8 +237,9 @@ def googleapis_translate(text: str, source_lang: str, target_lang: str, timeout:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
+    client = session if session is not None else requests
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        r = client.get(url, params=params, headers=headers, timeout=timeout)
     except Exception as e:
         raise e
 
@@ -255,6 +307,10 @@ class TranslationService:
         self._cache: OrderedDict[Tuple[str, str, str], str] = OrderedDict()
         self._rr_index = 0
         self._lock = threading.Lock()
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=1)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         self.circuit_breakers: Dict[str, CircuitBreaker] = {
             name: CircuitBreaker(60.0)
             for name in ["deepl", "azure", "mymemory", "google", "groq_llm"]
@@ -302,16 +358,18 @@ class TranslationService:
         """Returns active translation providers in strict priority cascade order (Azure -> MyMemory -> Google gtx), skipping cooldowns."""
         all_providers: List[Tuple[str, Callable[[str], str]]] = []
 
-        # 1. Azure Microsoft Translator (100% Primary Driver when key configured)
+        # 1. Azure Microsoft Translator (100% Primary Driver with persistent HTTP Keep-Alive)
         if AZURE_TRANSLATOR_KEY:
             all_providers.append((
                 "azure",
-                lambda t: MicrosoftTranslator(
+                lambda t: azure_translate(
+                    text=t,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
                     api_key=AZURE_TRANSLATOR_KEY,
                     region=AZURE_REGION,
-                    source=source_lang,
-                    target=target_lang
-                ).translate(t)
+                    session=self.session
+                )
             ))
 
         # 2. DeepL Free API (if key provided)
@@ -338,10 +396,10 @@ class TranslationService:
             ).translate(t)
         ))
 
-        # 4. Google Public API (client=gtx, high-resilience fallback)
+        # 4. Google Public API (client=gtx, high-resilience fallback with Keep-Alive)
         all_providers.append((
             "google",
-            lambda t: googleapis_translate(t, source_lang, target_lang)
+            lambda t: googleapis_translate(t, source_lang, target_lang, session=self.session)
         ))
 
         # Filter out providers currently in cooldown

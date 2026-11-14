@@ -301,11 +301,13 @@ class WebhookRelayManager:
 
             target_lang = dest_info["lang"]
 
-            if text_to_translate:
+            async def compute_chunks() -> List[str]:
+                if not text_to_translate:
+                    return [""]
                 if is_passthrough_text(text_to_translate):
-                    chunks = [text_to_translate]
+                    return [text_to_translate]
                 # If target channel is configured as Romanized Hindi, deliver conversational Hinglish
-                elif target_lang == "hi" and dest_info.get("is_romanized", False):
+                if target_lang == "hi" and dest_info.get("is_romanized", False):
                     base_english = normalized_english
                     if not base_english:
                         en_chunks = await self.translator.translate(
@@ -318,34 +320,33 @@ class WebhookRelayManager:
                     shielded_en, en_tokens = shield_syntax(base_english)
                     romanized_raw = await self.normalizer.to_romanized_hindi(shielded_en)
                     if romanized_raw:
-                        chunks = [restore_syntax(romanized_raw, en_tokens)]
+                        return [restore_syntax(romanized_raw, en_tokens)]
                     else:
-                        chunks = await self.translator.translate(
+                        return await self.translator.translate(
                             text=base_english,
                             source_lang="en",
                             target_lang="hi"
                         )
                 elif normalized_english:
                     if target_lang == "en":
-                        chunks = [normalized_english]
+                        return [normalized_english]
                     else:
-                        chunks = await self.translator.translate(
+                        return await self.translator.translate(
                             text=normalized_english,
                             source_lang="en",
                             target_lang=target_lang
                         )
                 else:
-                    chunks = await self.translator.translate(
+                    return await self.translator.translate(
                         text=text_to_translate,
                         source_lang=source_lang,
                         target_lang=target_lang
                     )
-            else:
-                chunks = [""]
 
-            reply_header = ""
-            if reply_author:
-                reply_header = await self._build_reply_header(
+            async def compute_reply_header() -> str:
+                if not reply_author:
+                    return ""
+                return await self._build_reply_header(
                     author_name=reply_author,
                     raw_snippet=raw_snippet,
                     source_lang=source_lang,
@@ -353,6 +354,9 @@ class WebhookRelayManager:
                     is_target_romanized=dest_info.get("is_romanized", False),
                     is_source_romanized=is_romanized_channel
                 )
+
+            # Parallelize main text translation and reply snippet translation
+            chunks, reply_header = await asyncio.gather(compute_chunks(), compute_reply_header())
 
             if reply_header and chunks:
                 chunks[0] = reply_header + chunks[0]
