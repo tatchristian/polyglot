@@ -89,16 +89,14 @@ def test_circuit_breaker_on_429_and_skip():
     assert service.circuit_breakers["mymemory"].state == CircuitState.HEALTHY
 
     # Simulate 429 TooManyRequests on MyMemory
-    with patch("translator.MyMemoryTranslator") as mock_mm, \
-         patch("translator.GoogleTranslator") as mock_gt:
+    with patch("translator.AZURE_TRANSLATOR_KEY", ""), \
+         patch("translator.DEEPL_API_KEY", ""), \
+         patch("translator.MyMemoryTranslator") as mock_mm, \
+         patch("translator.googleapis_translate", return_value="Hola desde Google") as mock_gt:
 
         mm_inst = MagicMock()
         mm_inst.translate.side_effect = TooManyRequests("MyMemory 429 Too Many Requests")
         mock_mm.return_value = mm_inst
-
-        gt_inst = MagicMock()
-        gt_inst.translate.return_value = "Hola desde Google"
-        mock_gt.return_value = gt_inst
 
         # Perform translation which encounters 429 on mymemory
         res = service._sync_translate("hello world", "en", "es")
@@ -116,18 +114,23 @@ def test_circuit_breaker_on_429_and_skip():
         assert "mymemory" not in provider_names
         assert "google" in provider_names
 
-def test_round_robin_rotation():
+def test_priority_cascade_order():
     service = TranslationService()
 
-    # With no API keys, healthy providers are mymemory and google
-    p1 = service._get_providers("en", "es", rotate=True)
-    p2 = service._get_providers("en", "es", rotate=True)
-    p3 = service._get_providers("en", "es", rotate=True)
+    # Case 1: When Azure key is configured, Azure is 100% primary driver (rotate=False default)
+    with patch("translator.AZURE_TRANSLATOR_KEY", "mock_key"), \
+         patch("translator.DEEPL_API_KEY", ""):
+        providers = service._get_providers("en", "es")
+        assert providers[0][0] == "azure"
+        assert providers[1][0] == "mymemory"
+        assert providers[2][0] == "google"
 
-    # Starting provider should rotate sequentially
-    assert p1[0][0] == "mymemory"
-    assert p2[0][0] == "google"
-    assert p3[0][0] == "mymemory"
+    # Case 2: When Azure key is empty, MyMemory is first, followed by Google gtx
+    with patch("translator.AZURE_TRANSLATOR_KEY", ""), \
+         patch("translator.DEEPL_API_KEY", ""):
+        providers = service._get_providers("en", "es")
+        assert providers[0][0] == "mymemory"
+        assert providers[1][0] == "google"
 
 @pytest.mark.asyncio
 async def test_sqlite_cache_persists_across_service_instances(tmp_path):

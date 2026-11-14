@@ -4,10 +4,10 @@ import re
 import time
 import asyncio
 import threading
+import requests
 from collections import OrderedDict
 from typing import List, Tuple, Dict, Optional, Callable
 from deep_translator import (
-    GoogleTranslator,
     MyMemoryTranslator,
     DeeplTranslator,
     MicrosoftTranslator,
@@ -169,6 +169,39 @@ def is_passthrough_text(text: str) -> bool:
 
     return False
 
+def googleapis_translate(text: str, source_lang: str, target_lang: str, timeout: float = 5.0) -> str:
+    """Translates text via Google's public translation endpoint (client=gtx) with JSON parsing and timeout."""
+    if not text or not text.strip():
+        return text
+
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": source_lang,
+        "tl": target_lang,
+        "dt": "t",
+        "q": text,
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    except Exception as e:
+        raise e
+
+    if r.status_code == 429:
+        raise TooManyRequests("Google gtx 429 Too Many Requests")
+    r.raise_for_status()
+
+    data = r.json()
+    if not data or not data[0]:
+        return text
+
+    translated_parts = [part[0] for part in data[0] if part and part[0]]
+    return "".join(translated_parts)
+
 class CircuitState:
     HEALTHY = "HEALTHY"
     COOLDOWN = "COOLDOWN"
@@ -265,23 +298,11 @@ class TranslationService:
             except Exception as e:
                 print(f"L2 cache save error: {e}")
 
-    def _get_providers(self, source_lang: str, target_lang: str, rotate: bool = True) -> List[Tuple[str, Callable[[str], str]]]:
-        """Returns active translation providers, skipping cooldowns and rotating starting provider."""
+    def _get_providers(self, source_lang: str, target_lang: str, rotate: bool = False) -> List[Tuple[str, Callable[[str], str]]]:
+        """Returns active translation providers in strict priority cascade order (Azure -> MyMemory -> Google gtx), skipping cooldowns."""
         all_providers: List[Tuple[str, Callable[[str], str]]] = []
 
-        # 1. DeepL Free API (if key provided)
-        if DEEPL_API_KEY:
-            all_providers.append((
-                "deepl",
-                lambda t: DeeplTranslator(
-                    api_key=DEEPL_API_KEY,
-                    source=source_lang,
-                    target=target_lang,
-                    use_free_api=True
-                ).translate(t)
-            ))
-
-        # 2. Azure Microsoft Translator (if key provided)
+        # 1. Azure Microsoft Translator (100% Primary Driver when key configured)
         if AZURE_TRANSLATOR_KEY:
             all_providers.append((
                 "azure",
@@ -290,6 +311,18 @@ class TranslationService:
                     region=AZURE_REGION,
                     source=source_lang,
                     target=target_lang
+                ).translate(t)
+            ))
+
+        # 2. DeepL Free API (if key provided)
+        if DEEPL_API_KEY:
+            all_providers.append((
+                "deepl",
+                lambda t: DeeplTranslator(
+                    api_key=DEEPL_API_KEY,
+                    source=source_lang,
+                    target=target_lang,
+                    use_free_api=True
                 ).translate(t)
             ))
 
@@ -305,13 +338,10 @@ class TranslationService:
             ).translate(t)
         ))
 
-        # 4. Google Translate (free scraping fallback)
+        # 4. Google Public API (client=gtx, high-resilience fallback)
         all_providers.append((
             "google",
-            lambda t: GoogleTranslator(
-                source=source_lang,
-                target=target_lang
-            ).translate(t)
+            lambda t: googleapis_translate(t, source_lang, target_lang)
         ))
 
         # Filter out providers currently in cooldown
