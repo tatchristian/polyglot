@@ -168,3 +168,30 @@ async def test_sqlite_cache_persists_across_service_instances(tmp_path):
     assert service2._get_from_cache("en", "fr", "Hello world") == "Bonjour le monde"
 
     await db2.close()
+
+def test_negation_safe_fuzzy_cache_hit():
+    service = TranslationService(cache_size=10)
+    service._save_to_cache("en", "es", "thank you very much", "muchas gracias")
+
+    # Slight slang/typo variation: "thank you very much" vs "thank you veri much" (95% ratio)
+    fuzzy_result = service._get_from_cache("en", "es", "thank you veri much")
+    assert fuzzy_result == "muchas gracias"
+    assert service.stats.get("fuzzy_cache_hits", 0) >= 1
+
+    # Exact key is now backfilled
+    assert ("en", "es", "thank you veri much") in service._cache
+
+def test_negation_guard_blocks_polarity_inversion():
+    service = TranslationService(cache_size=10)
+    service._save_to_cache("en", "es", "yes bro let's go play", "si hermano vamos a jugar")
+
+    # "no bro let's go play" is 85-90% similar textually, but contains opposite polarity "no"
+    mismatch_result = service._get_from_cache("en", "es", "no bro let's go play")
+    assert mismatch_result is None
+
+def test_game_brands_passthrough():
+    assert is_passthrough_text("Valorant") is True
+    assert is_passthrough_text("Apex Legends") is True
+    assert is_passthrough_text("Roblox") is True
+    assert is_passthrough_text("Minecraft") is True
+    assert is_passthrough_text("Fortnite") is True

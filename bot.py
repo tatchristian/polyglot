@@ -564,11 +564,11 @@ async def translate_latency(
             if translation_ms > 0:
                 provider_name = f"🔷 Azure ({translation_ms} ms) ➔ 🤖 Groq LPU ({llm_ms} ms)"
 
-        # Case B: Sent from a Romanized channel (e.g. #hindi) -> Requires Groq LLM Normalizer!
-        elif src_lang == "hi" and is_src_romanized:
+        # Case B: Sent from a Romanized channel (e.g. #hindi, #indonesian) -> Requires Groq LLM Normalizer!
+        elif is_src_romanized:
             shielded_in, in_tokens = shield_syntax(text_to_test)
             t_llm0 = time.perf_counter()
-            norm_en = await relay_manager.normalizer.normalize_hinglish(shielded_in)
+            norm_en = await relay_manager.normalizer.normalize_slang(shielded_in)
             t_llm1 = time.perf_counter()
             llm_ms = round((t_llm1 - t_llm0) * 1000, 2)
             normalized_english = restore_syntax(norm_en, in_tokens) if norm_en else text_to_test

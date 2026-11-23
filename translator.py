@@ -4,9 +4,10 @@ import re
 import time
 import asyncio
 import threading
+import difflib
 import requests
 from collections import OrderedDict
-from typing import List, Tuple, Dict, Optional, Callable
+from typing import List, Tuple, Dict, Optional, Callable, Set
 from deep_translator import (
     MyMemoryTranslator,
     DeeplTranslator,
@@ -27,8 +28,43 @@ CODE_BLOCK_PATTERN = re.compile(r"```[\s\S]*?```")
 INLINE_CODE_PATTERN = re.compile(r"`[^`\n]+`")
 MENTION_PATTERN = re.compile(r"<@[!&]?[0-9]+>|<#[0-9]+>")
 
+# Game brands that must never be translated into dictionary words (e.g. Valorant != Berani)
+PROTECTED_GAME_BRANDS = [
+    r"(?:\b|(?:nge|di)-)Valorant(?:'(?:ta|a|te|da|un))?\b",
+    r"(?:\b|(?:nge|di)-)Apex(?:\s+Legends)?(?:'(?:ta|a|te|da|un))?\b",
+    r"(?:\b|(?:nge|di)-)Roblox(?:'(?:ta|a|te|da|un))?\b",
+    r"(?:\b|(?:nge|di)-)Fortnite(?:'(?:ta|a|te|da|un))?\b",
+    r"(?:\b|(?:nge|di)-)Minecraft(?:'(?:ta|a|te|da|un))?\b",
+    r"\bLeague\s+of\s+Legends\b",
+    r"\bOverwatch\b",
+    r"\bCounter-Strike\b",
+    r"\bCS:?GO\b",
+    r"\bCS2\b",
+    r"\bRocket\s+League\b",
+    r"\bPUBG\b",
+    r"\bGenshin(?:\s+Impact)?\b",
+    r"\bMobile\s+Legends\b",
+    r"\bDota(?:\s*2)?\b",
+]
+PROTECTED_BRANDS_RE = re.compile("|".join(PROTECTED_GAME_BRANDS), re.IGNORECASE)
+
+# Universal multilingual negation words to prevent inverted polarity in fuzzy caching
+NEGATION_WORDS: Set[str] = {
+    "no", "not", "dont", "doesnt", "isnt", "arent", "aint", "wont", "cant",
+    "never", "none", "nahi", "nahin", "na", "mat",
+    "tidak", "bukan", "tak", "gak", "nggak", "g",
+    "la", "maa", "mush",
+    "nyet", "ne",
+    "nein", "pas", "non",
+}
+
+def extract_negation_words(text: str) -> Set[str]:
+    """Extracts all recognized negation words from text to guard against polarity inversion."""
+    words = re.findall(r"\b\w+\b", text.lower())
+    return {w for w in words if w in NEGATION_WORDS}
+
 def shield_syntax(text: str) -> Tuple[str, Dict[str, str]]:
-    """Replaces custom emojis, mentions, and code blocks with unique tokens before translation."""
+    """Replaces custom emojis, mentions, code blocks, and protected game brands with unique tokens before translation."""
     token_map: Dict[str, str] = {}
     counter = 0
 
@@ -60,10 +96,18 @@ def shield_syntax(text: str) -> Tuple[str, Dict[str, str]]:
         counter += 1
         return token
 
+    def replace_brand(match: re.Match) -> str:
+        nonlocal counter
+        token = f"__DISCORD_BRAND_{counter}__"
+        token_map[token] = match.group(0)
+        counter += 1
+        return token
+
     shielded = CODE_BLOCK_PATTERN.sub(replace_code_block, text)
     shielded = INLINE_CODE_PATTERN.sub(replace_inline_code, shielded)
     shielded = EMOJI_PATTERN.sub(replace_emoji, shielded)
     shielded = MENTION_PATTERN.sub(replace_mention, shielded)
+    shielded = PROTECTED_BRANDS_RE.sub(replace_brand, shielded)
 
     return shielded, token_map
 
@@ -154,9 +198,9 @@ def is_passthrough_text(text: str) -> bool:
     if not re.search(r"[a-zA-Z\u00C0-\u024F\u0400-\u04FF\u0600-\u06FF\u0900-\u097F\u0E00-\u0E7F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF]", cleaned):
         return True
 
-    # 4. Universal single-word gaming/internet tokens
+    # 4. Universal single-word gaming/internet tokens or protected game titles
     lowered = cleaned.lower()
-    if lowered in UNIVERSAL_TOKENS:
+    if lowered in UNIVERSAL_TOKENS or PROTECTED_BRANDS_RE.fullmatch(cleaned):
         return True
     # Collapse repeated consecutive characters (e.g. loool -> lol, yessss -> yes, okk -> ok)
     collapsed = re.sub(r'(.)\1{2,}', r'\1', lowered)
@@ -318,6 +362,7 @@ class TranslationService:
         self.stats = {
             "total_translated": 0,
             "cache_hits": 0,
+            "fuzzy_cache_hits": 0,
             "deepl_success": 0,
             "azure_success": 0,
             "mymemory_success": 0,
@@ -329,11 +374,35 @@ class TranslationService:
         }
 
     def _get_from_cache(self, source_lang: str, target_lang: str, text: str) -> Optional[str]:
-        """Looks up a previously translated phrase from L1 LRU memory."""
-        key = (source_lang, target_lang, text.strip().lower())
+        """Looks up a previously translated phrase from L1 LRU memory with negation-safe fuzzy fallback."""
+        cleaned_text = text.strip()
+        lowered_text = cleaned_text.lower()
+        key = (source_lang, target_lang, lowered_text)
+
+        # 1. Exact O(1) hit
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
+
+        # 2. Negation-safe fuzzy matching using Python difflib
+        query_len = len(lowered_text)
+        if query_len >= 4:
+            query_negs = extract_negation_words(lowered_text)
+            len_margin = max(3, int(query_len * 0.25))
+
+            # Scan recent cache items for matching language pair with length-bucket pruning
+            for (s_lang, t_lang, cached_key), cached_val in reversed(self._cache.items()):
+                if s_lang == source_lang and t_lang == target_lang:
+                    if abs(len(cached_key) - query_len) <= len_margin:
+                        # Negation guard: Polarity words must match identically
+                        if extract_negation_words(cached_key) == query_negs:
+                            ratio = difflib.SequenceMatcher(None, lowered_text, cached_key).ratio()
+                            if ratio >= 0.90:
+                                self.stats["fuzzy_cache_hits"] = self.stats.get("fuzzy_cache_hits", 0) + 1
+                                # Auto-backfill for future instant O(1) hits
+                                self._save_to_cache(source_lang, target_lang, cleaned_text, cached_val)
+                                return cached_val
+
         return None
 
     def _save_to_cache(self, source_lang: str, target_lang: str, text: str, translated: str):

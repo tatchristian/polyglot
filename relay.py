@@ -12,7 +12,7 @@ from config import (
 from translator import TranslationService, shield_syntax, restore_syntax, is_passthrough_text
 from database import DatabaseManager
 from hinglish_gatekeeper import is_potential_hinglish, is_already_english
-from hinglish_normalizer import HinglishNormalizer
+from slang_normalizer import SlangNormalizer, HinglishNormalizer, has_native_script
 from spam_filter import AntiSpamManager
 
 class LRUMessageMap:
@@ -168,7 +168,7 @@ class WebhookRelayManager:
 
         # Normalize source to base English
         base_en = None
-        if source_lang == "hi" and is_source_romanized:
+        if is_source_romanized and not has_native_script(raw_snippet):
             base_en = await self.normalizer.normalize_hinglish(raw_snippet)
 
         if not base_en:
@@ -265,17 +265,23 @@ class WebhookRelayManager:
         should_use_ai = is_romanized_channel or is_potential_hinglish(text_to_translate, source_lang)
         if is_passthrough_text(text_to_translate):
             should_use_ai = False
+        elif has_native_script(text_to_translate):
+            # Native non-Latin script in a Romanized channel (Devanagari, Arabic, Cyrillic, etc.)
+            # Zero-token direct bypass straight to Azure AI Translator!
+            should_use_ai = False
+            self.normalizer.stats["native_script_bypasses"] = self.normalizer.stats.get("native_script_bypasses", 0) + 1
         elif is_romanized_channel and is_already_english(text_to_translate):
             # Already English in a Romanized channel: zero-token direct bypass!
             should_use_ai = False
             normalized_english = text_to_translate
         if text_to_translate and should_use_ai:
-            self.normalizer.stats["hinglish_detections"] += 1
+            self.normalizer.stats["slang_detections"] = self.normalizer.stats.get("slang_detections", 0) + 1
+            self.normalizer.stats["hinglish_detections"] = self.normalizer.stats.get("hinglish_detections", 0) + 1
             parent_context = None
             if message.reference and message.reference.resolved:
                 parent_context = getattr(message.reference.resolved, "content", None)
 
-            # Shield mentions, emojis, and code tokens so AI doesn't mangle user IDs
+            # Shield mentions, emojis, game brands, and code tokens so AI doesn't mangle user IDs
             shielded_input, in_tokens = shield_syntax(text_to_translate)
             raw_normalized = await self.normalizer.normalize_hinglish(
                 shielded_input,
@@ -424,9 +430,9 @@ class WebhookRelayManager:
         if not updated_text:
             return
 
-        # Check if edited text in a Romanized channel is Hinglish requiring AI interpretation
+        # Check if edited text in a Romanized channel requires AI slang interpretation
         normalized_english = None
-        if source_lang == "hi" and is_source_romanized:
+        if is_source_romanized and not has_native_script(updated_text):
             shielded_input, in_tokens = shield_syntax(updated_text)
             raw_normalized = await self.normalizer.normalize_hinglish(shielded_input)
             if raw_normalized:

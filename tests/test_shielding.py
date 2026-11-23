@@ -48,6 +48,31 @@ def test_mention_shielding():
     assert "<@123456789012345678>" not in shielded
     assert "<#112233445566778899>" not in shielded
     assert len(tokens) == 4
+    restored = restore_syntax(shielded, tokens)
+    assert restored == original
+
+def test_game_brand_shielding():
+    original = "Let's play Valorant, Apex Legends, and Roblox tonight!"
+    shielded, tokens = shield_syntax(original)
+
+    assert "Valorant" not in shielded
+    assert "Apex Legends" not in shielded
+    assert "Roblox" not in shielded
+    assert len(tokens) == 3
+
+    restored = restore_syntax(shielded, tokens)
+    assert restored == original
+
+def test_multilingual_game_brand_prefixes_shielding():
+    original = "Ayo kita nge-Valorant atau main di-Roblox!"
+    shielded, tokens = shield_syntax(original)
+
+    assert "nge-Valorant" not in shielded
+    assert "di-Roblox" not in shielded
+    assert len(tokens) == 2
+
+    restored = restore_syntax(shielded, tokens)
+    assert restored == original
 
     restored = restore_syntax(shielded, tokens)
     assert restored == original

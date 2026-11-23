@@ -238,9 +238,10 @@ class DatabaseManager:
         self,
         source_lang: str,
         target_lang: str,
-        text: str
+        text: str,
+        allow_fuzzy: bool = True
     ) -> Optional[str]:
-        """Retrieves a cached translation from L2 SQLite cache."""
+        """Retrieves a cached translation from L2 SQLite cache with optional negation-safe fuzzy fallback."""
         if not self._conn:
             return None
         clean_text = text.strip().lower()
@@ -249,7 +250,34 @@ class DatabaseManager:
             WHERE source_lang = ? AND target_lang = ? AND source_text = ?;
         """, (source_lang.lower(), target_lang.lower(), clean_text)) as cursor:
             row = await cursor.fetchone()
-            return row[0] if row else None
+            if row:
+                return row[0]
+
+        if not allow_fuzzy or len(clean_text) < 4:
+            return None
+
+        # Bounded fuzzy scan of the 100 most recent translations for this language pair
+        import difflib
+        from translator import extract_negation_words
+        query_negs = extract_negation_words(clean_text)
+        len_margin = max(3, int(len(clean_text) * 0.25))
+
+        async with self._conn.execute("""
+            SELECT source_text, translated_text FROM translation_cache
+            WHERE source_lang = ? AND target_lang = ?
+            ORDER BY created_at DESC LIMIT 100;
+        """, (source_lang.lower(), target_lang.lower())) as cursor:
+            rows = await cursor.fetchall()
+            for cached_source, cached_trans in rows:
+                if abs(len(cached_source) - len(clean_text)) <= len_margin:
+                    if extract_negation_words(cached_source) == query_negs:
+                        ratio = difflib.SequenceMatcher(None, clean_text, cached_source).ratio()
+                        if ratio >= 0.90:
+                            # Auto-backfill for future instant O(1) hits
+                            await self.set_cached_translation(source_lang, target_lang, text, cached_trans)
+                            return cached_trans
+
+        return None
 
     async def set_cached_translation(
         self,
