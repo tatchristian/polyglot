@@ -109,7 +109,7 @@ def test_circuit_breaker_on_429_and_skip():
         assert service.stats["failovers"] >= 1
 
         # On subsequent provider lookup, mymemory must be skipped
-        providers = service._get_providers("en", "es", rotate=False)
+        providers = service._get_providers("en", "es")
         provider_names = [p[0] for p in providers]
         assert "mymemory" not in provider_names
         assert "google" in provider_names
@@ -195,3 +195,40 @@ def test_game_brands_passthrough():
     assert is_passthrough_text("Roblox") is True
     assert is_passthrough_text("Minecraft") is True
     assert is_passthrough_text("Fortnite") is True
+
+@pytest.mark.asyncio
+async def test_fuzzy_cache_numeric_guard_prevents_swap():
+    service = TranslationService(cache_size=10)
+    service._save_to_cache("en", "es", "meet in 2 mins", "nos vemos en 2 mins")
+
+    # Different digit should NOT match even though similarity is > 90%
+    assert service._get_from_cache("en", "es", "meet in 9 mins") is None
+
+    db = DatabaseManager(db_path=":memory:")
+    await db.connect()
+    await db.set_cached_translation("en", "es", "need 2 more players", "faltan 2 jugadores")
+    assert await db.get_cached_translation("en", "es", "need 5 more players") is None
+    await db.close()
+
+def test_auto_source_omits_azure_from_and_skips_mymemory():
+    from translator import azure_translate
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = [{"translations": [{"text": "Hola", "to": "es"}]}]
+    mock_session = MagicMock()
+    mock_session.post.return_value = mock_resp
+
+    res = azure_translate("Hello", "auto", "es", api_key="key", region="westus2", session=mock_session)
+    assert res == "Hola"
+    sent_params = mock_session.post.call_args.kwargs["params"]
+    assert "from" not in sent_params
+    assert sent_params["to"] == "es"
+
+    service = TranslationService()
+    with patch("translator.AZURE_TRANSLATOR_KEY", "fake_key"), \
+         patch("translator.DEEPL_API_KEY", "fake_deepl"):
+        provider_names = [p[0] for p in service._get_providers("auto", "es")]
+        assert "azure" in provider_names
+        assert "google" in provider_names
+        assert "mymemory" not in provider_names
+        assert "deepl" not in provider_names

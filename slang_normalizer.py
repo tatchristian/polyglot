@@ -56,6 +56,7 @@ class SlangNormalizer:
         self.client = AsyncGroq(api_key=api_key) if api_key else None
         self.groq_models = groq_models or list(GROQ_MODELS)
         self.openrouter_models = openrouter_models or list(OPENROUTER_MODELS)
+        self._http_client: Optional[httpx.AsyncClient] = None
         self.stats = {
             "slang_detections": 0,
             "hinglish_detections": 0,
@@ -98,6 +99,9 @@ class SlangNormalizer:
 
         # 2. Try OpenRouter Free Pool if configured
         if self.openrouter_api_key:
+            if self._http_client is None or self._http_client.is_closed:
+                self._http_client = httpx.AsyncClient(timeout=5.0)
+
             for model in self.openrouter_models:
                 # Absolute zero-cost guarantee: only invoke explicitly free models
                 if not model.endswith(":free"):
@@ -105,29 +109,28 @@ class SlangNormalizer:
                     continue
 
                 try:
-                    async with httpx.AsyncClient(timeout=5.0) as http_client:
-                        res = await http_client.post(
-                            "https://openrouter.ai/api/v1/chat/completions",
-                            headers={
-                                "Authorization": f"Bearer {self.openrouter_api_key}",
-                                "HTTP-Referer": "https://github.com/tatchristian/polyglot",
-                                "X-Title": "Polyglot Discord Translator"
-                            },
-                            json={
-                                "model": model,
-                                "messages": messages,
-                                "temperature": temperature,
-                                "max_tokens": max_tokens,
-                            }
-                        )
-                        if res.status_code == 200:
-                            data = res.json()
-                            result = data["choices"][0]["message"]["content"].strip()
-                            if result.startswith('"') and result.endswith('"'):
-                                result = result[1:-1].strip()
-                            return result
-                        else:
-                            print(f"OpenRouter '{model}' returned status {res.status_code}. Cascading...")
+                    res = await self._http_client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.openrouter_api_key}",
+                            "HTTP-Referer": "https://github.com/tatchristian/polyglot",
+                            "X-Title": "Polyglot Discord Translator"
+                        },
+                        json={
+                            "model": model,
+                            "messages": messages,
+                            "temperature": temperature,
+                            "max_tokens": max_tokens,
+                        }
+                    )
+                    if res.status_code == 200:
+                        data = res.json()
+                        result = data["choices"][0]["message"]["content"].strip()
+                        if result.startswith('"') and result.endswith('"'):
+                            result = result[1:-1].strip()
+                        return result
+                    else:
+                        print(f"OpenRouter '{model}' returned status {res.status_code}. Cascading...")
                 except Exception as e:
                     print(f"OpenRouter model '{model}' failed ({e}). Cascading...")
                     continue

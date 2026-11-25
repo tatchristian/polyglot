@@ -3,7 +3,7 @@
 import re
 from typing import Set
 
-# High-frequency phonetic romanized Hindi tokens
+# High-frequency phonetic romanized Hindi tokens (excludes English homographs like 'lag', 'scene')
 HINGLISH_KEYWORDS: Set[str] = {
     "bhai", "bhaiya", "yaar", "dost", "kya", "nahi", "nahin", "na",
     "haan", "karo", "karna", "kar", "karte", "aaj", "kal", "parso",
@@ -13,7 +13,7 @@ HINGLISH_KEYWORDS: Set[str] = {
     "matlab", "kyun", "kyu", "shuru", "khatam", "kitna", "kitne", "kitni",
     "apna", "apne", "mera", "meri", "tere", "teri", "karenge", "hoga",
     "hogi", "honge", "raha", "rahe", "rahi", "kr", "krdo", "kro",
-    "bolte", "scene", "pata", "lag", "rha", "rhe", "wali", "wale", "kisko",
+    "bolte", "pata", "rha", "rhe", "wali", "wale", "kisko",
 }
 
 # Pre-compiled word boundary pattern for fast O(1) matching

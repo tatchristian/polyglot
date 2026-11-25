@@ -63,6 +63,10 @@ def extract_negation_words(text: str) -> Set[str]:
     words = re.findall(r"\b\w+\b", text.lower())
     return {w for w in words if w in NEGATION_WORDS}
 
+def extract_fuzzy_guards(text: str) -> Tuple[Set[str], Tuple[str, ...]]:
+    """Extracts negation words and numeric tokens that must match identically for fuzzy cache hits."""
+    return extract_negation_words(text), tuple(re.findall(r"\d+", text))
+
 def shield_syntax(text: str) -> Tuple[str, Dict[str, str]]:
     """Replaces custom emojis, mentions, code blocks, and protected game brands with unique tokens before translation."""
     token_map: Dict[str, str] = {}
@@ -231,11 +235,12 @@ def azure_translate(
 
     reg = region or AZURE_REGION or "westus2"
     url = "https://api.cognitive.microsofttranslator.com/translate"
-    params = {
+    params: Dict[str, str] = {
         "api-version": "3.0",
-        "from": source_lang,
         "to": target_lang
     }
+    if source_lang and source_lang.lower() != "auto":
+        params["from"] = source_lang
     headers = {
         "Ocp-Apim-Subscription-Key": key,
         "Ocp-Apim-Subscription-Region": reg,
@@ -349,8 +354,6 @@ class TranslationService:
         self.db = db
         self.cache_size = cache_size
         self._cache: OrderedDict[Tuple[str, str, str], str] = OrderedDict()
-        self._rr_index = 0
-        self._lock = threading.Lock()
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=1)
         self.session.mount("https://", adapter)
@@ -384,18 +387,18 @@ class TranslationService:
             self._cache.move_to_end(key)
             return self._cache[key]
 
-        # 2. Negation-safe fuzzy matching using Python difflib
+        # 2. Negation- and digit-safe fuzzy matching using Python difflib
         query_len = len(lowered_text)
         if query_len >= 4:
-            query_negs = extract_negation_words(lowered_text)
+            query_guards = extract_fuzzy_guards(lowered_text)
             len_margin = max(3, int(query_len * 0.25))
 
             # Scan recent cache items for matching language pair with length-bucket pruning
             for (s_lang, t_lang, cached_key), cached_val in reversed(self._cache.items()):
                 if s_lang == source_lang and t_lang == target_lang:
                     if abs(len(cached_key) - query_len) <= len_margin:
-                        # Negation guard: Polarity words must match identically
-                        if extract_negation_words(cached_key) == query_negs:
+                        # Guard: Polarity words and numbers must match identically
+                        if extract_fuzzy_guards(cached_key) == query_guards:
                             ratio = difflib.SequenceMatcher(None, lowered_text, cached_key).ratio()
                             if ratio >= 0.90:
                                 self.stats["fuzzy_cache_hits"] = self.stats.get("fuzzy_cache_hits", 0) + 1
@@ -414,6 +417,35 @@ class TranslationService:
         if len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
 
+    async def lookup_cache(
+        self,
+        source_lang: str,
+        target_lang: str,
+        text: str,
+        count_hit: bool = True
+    ) -> Optional[str]:
+        """Checks L1 RAM cache then L2 SQLite cache, backfilling L1 on hit."""
+        cached = self._get_from_cache(source_lang, target_lang, text)
+        if cached:
+            if count_hit:
+                self.stats["cache_hits"] += 1
+                self.stats["total_translated"] += 1
+            return cached
+
+        if self.db:
+            try:
+                l2_cached = await self.db.get_cached_translation(source_lang, target_lang, text)
+                if l2_cached:
+                    if count_hit:
+                        self.stats["cache_hits"] += 1
+                        self.stats["total_translated"] += 1
+                    self._save_to_cache(source_lang, target_lang, text, l2_cached)
+                    return l2_cached
+            except Exception as e:
+                print(f"L2 cache lookup error: {e}")
+
+        return None
+
     async def _save_translation(self, source_lang: str, target_lang: str, text: str, translated: str):
         """Stores translated phrase in both L1 RAM cache and L2 SQLite cache."""
         self._save_to_cache(source_lang, target_lang, text, translated)
@@ -423,9 +455,10 @@ class TranslationService:
             except Exception as e:
                 print(f"L2 cache save error: {e}")
 
-    def _get_providers(self, source_lang: str, target_lang: str, rotate: bool = False) -> List[Tuple[str, Callable[[str], str]]]:
-        """Returns active translation providers in strict priority cascade order (Azure -> MyMemory -> Google gtx), skipping cooldowns."""
+    def _get_providers(self, source_lang: str, target_lang: str) -> List[Tuple[str, Callable[[str], str]]]:
+        """Returns active translation providers in strict priority cascade order (Azure -> DeepL -> MyMemory -> Google gtx), skipping cooldowns."""
         all_providers: List[Tuple[str, Callable[[str], str]]] = []
+        is_auto_source = source_lang.lower() == "auto"
 
         # 1. Azure Microsoft Translator (100% Primary Driver with persistent HTTP Keep-Alive)
         if AZURE_TRANSLATOR_KEY:
@@ -441,8 +474,8 @@ class TranslationService:
                 )
             ))
 
-        # 2. DeepL Free API (if key provided)
-        if DEEPL_API_KEY:
+        # 2. DeepL Free API (if key provided; DeepL rejects 'auto' source)
+        if DEEPL_API_KEY and not is_auto_source:
             all_providers.append((
                 "deepl",
                 lambda t: DeeplTranslator(
@@ -453,33 +486,27 @@ class TranslationService:
                 ).translate(t)
             ))
 
-        # 3. MyMemory API (zero-key free tier, 50k words/day with email)
-        mm_src = MYMEMORY_LANG_MAP.get(source_lang, source_lang)
-        mm_target = MYMEMORY_LANG_MAP.get(target_lang, target_lang)
-        all_providers.append((
-            "mymemory",
-            lambda t: MyMemoryTranslator(
-                source=mm_src,
-                target=mm_target,
-                email=MYMEMORY_EMAIL or None
-            ).translate(t)
-        ))
+        # 3. MyMemory API (zero-key free tier; MyMemory rejects 'auto' source)
+        if not is_auto_source:
+            mm_src = MYMEMORY_LANG_MAP.get(source_lang, source_lang)
+            mm_target = MYMEMORY_LANG_MAP.get(target_lang, target_lang)
+            all_providers.append((
+                "mymemory",
+                lambda t: MyMemoryTranslator(
+                    source=mm_src,
+                    target=mm_target,
+                    email=MYMEMORY_EMAIL or None
+                ).translate(t)
+            ))
 
-        # 4. Google Public API (client=gtx, high-resilience fallback with Keep-Alive)
+        # 4. Google Public API (client=gtx, supports 'auto' source with Keep-Alive)
         all_providers.append((
             "google",
             lambda t: googleapis_translate(t, source_lang, target_lang, session=self.session)
         ))
 
         # Filter out providers currently in cooldown
-        healthy = [p for p in all_providers if self.circuit_breakers.get(p[0], CircuitBreaker()).is_healthy]
-        if not healthy or not rotate:
-            return healthy
-
-        with self._lock:
-            start_idx = self._rr_index % len(healthy)
-            self._rr_index += 1
-            return healthy[start_idx:] + healthy[:start_idx]
+        return [p for p in all_providers if self.circuit_breakers.get(p[0], CircuitBreaker()).is_healthy]
 
     def _sync_translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """Translates text cascading through providers until one succeeds."""
@@ -533,25 +560,10 @@ class TranslationService:
         if is_passthrough_text(text):
             return chunk_message(text)
 
-        # 2. L1 LRU Cache Check: Instant hit without consuming any API calls or tokens
-        cached = self._get_from_cache(source_lang, target_lang, text)
+        # 2. L1 RAM + L2 SQLite Cache Check: Instant hit without consuming API calls or tokens
+        cached = await self.lookup_cache(source_lang, target_lang, text)
         if cached:
-            self.stats["cache_hits"] += 1
-            self.stats["total_translated"] += 1
             return chunk_message(cached)
-
-        # 3. L2 SQLite Cache Check: Persistent across bot restarts
-        if self.db:
-            try:
-                l2_cached = await self.db.get_cached_translation(source_lang, target_lang, text)
-                if l2_cached:
-                    self.stats["cache_hits"] += 1
-                    self.stats["total_translated"] += 1
-                    # Backfill L1 RAM
-                    self._save_to_cache(source_lang, target_lang, text, l2_cached)
-                    return chunk_message(l2_cached)
-            except Exception as e:
-                print(f"L2 cache lookup error: {e}")
 
         translated_text = None
         try:

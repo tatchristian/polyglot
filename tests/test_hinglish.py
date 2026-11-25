@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 from hinglish_gatekeeper import is_potential_hinglish
-from hinglish_normalizer import HinglishNormalizer
+from slang_normalizer import HinglishNormalizer
 
 def test_hinglish_gatekeeper_detection():
     # Common Hinglish phrases
@@ -11,10 +11,11 @@ def test_hinglish_gatekeeper_detection():
     assert is_potential_hinglish("mujhe nahi pata yaar") is True
     assert is_potential_hinglish("accha theek hai") is True
 
-    # Standard English phrases should not trigger
+    # Standard English phrases (including gaming terms like lag/scene) should not trigger
     assert is_potential_hinglish("Hello everyone, how are you doing today?") is False
     assert is_potential_hinglish("The tournament schedule will be announced tomorrow.") is False
     assert is_potential_hinglish("Good game well played") is False
+    assert is_potential_hinglish("my game has lag in this scene") is False
 
     # Numbers and emojis should not trigger
     assert is_potential_hinglish("123456") is False

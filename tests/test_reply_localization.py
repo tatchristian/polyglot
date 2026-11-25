@@ -125,3 +125,81 @@ async def test_relay_message_parallel_reply_delivery():
     assert "Aquí está mi respuesta para ti" in content
     assert call_kwargs["wait"] is True
 
+@pytest.mark.asyncio
+async def test_reply_snippet_shields_game_brands_and_mentions():
+    bot_mock = MagicMock(spec=discord.Client)
+    service = TranslationService()
+    mgr = WebhookRelayManager(bot_mock, service, MagicMock())
+
+    mgr.normalizer.normalize_hinglish = AsyncMock(
+        side_effect=lambda txt, parent_context=None: txt.replace("aaj", "today").replace("khelega", "play")
+    )
+
+    header = await mgr._build_reply_header(
+        author_name="Player",
+        raw_snippet="aaj Valorant khelega <@123456>",
+        source_lang="hi",
+        target_lang="en",
+        is_source_romanized=True
+    )
+
+    called_text = mgr.normalizer.normalize_hinglish.call_args.args[0]
+    assert "Valorant" not in called_text
+    assert "<@123456>" not in called_text
+    assert "Valorant" in header
+    assert "<@123456>" in header
+
+@pytest.mark.asyncio
+async def test_long_reply_rechunked_within_discord_limit():
+    bot_mock = MagicMock(spec=discord.Client)
+    bot_mock.user = MagicMock()
+    service = TranslationService()
+    db_mock = MagicMock()
+    db_mock.find_conversation_uuid = AsyncMock(return_value=None)
+    db_mock.record_relayed_messages = AsyncMock()
+
+    mgr = WebhookRelayManager(bot_mock, service, db_mock)
+    mgr.channels = {
+        1001: {"lang": "en", "is_romanized": False, "guild_id": 1, "group_id": "1:default"},
+        1002: {"lang": "es", "is_romanized": False, "guild_id": 1, "group_id": "1:default"},
+    }
+
+    dest_chan = MagicMock(spec=discord.TextChannel)
+    dest_chan.id = 1002
+    dest_chan.name = "spanish"
+    dest_chan.guild = MagicMock(id=1)
+    bot_mock.get_channel.return_value = dest_chan
+
+    wh_mock = MagicMock()
+    wh_mock.send = AsyncMock(return_value=MagicMock(id=7001))
+    mgr.get_or_create_webhook = AsyncMock(return_value=wh_mock)
+
+    ref_msg = MagicMock()
+    ref_msg.author.display_name = "Alice"
+    ref_msg.content = "Check this long question"
+
+    msg = MagicMock(spec=discord.Message)
+    msg.id = 999
+    msg.channel = MagicMock(spec=discord.TextChannel, id=1001)
+    msg.guild = MagicMock(id=1)
+    msg.author.bot = False
+    msg.author.id = 10
+    msg.author.display_name = "Bob"
+    msg.author.display_avatar.url = "https://example.com/a.png"
+    msg.webhook_id = None
+    msg.content = " ".join(f"messageword{i}" for i in range(140))  # ~1950 varied chars
+    msg.attachments = []
+    msg.reference = MagicMock(message_id=50, resolved=ref_msg)
+
+    long_translation = "palabra " * 248  # 1984 chars (just under 2000 before reply header)
+    service.translate = AsyncMock(side_effect=[
+        [long_translation],
+        ["Mira esta pregunta larga"]
+    ])
+
+    await mgr.relay_message(msg)
+
+    assert wh_mock.send.call_count == 2
+    for call in wh_mock.send.call_args_list:
+        assert len(call.kwargs["content"]) <= 2000
+

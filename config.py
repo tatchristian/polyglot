@@ -46,13 +46,8 @@ MAX_DISCORD_MESSAGE_LENGTH = 2000
 MAX_LRU_CACHE_SIZE = 1000
 MAX_CONCURRENT_RELAYS = 5
 
-# Default channel IDs if not configured in environment variables (for cloud deployment)
-DEFAULT_CHANNELS: Dict[int, str] = {
-    1570749033717436446: "en",
-    1570749049970102284: "es",
-    1570749076151078992: "ja",
-    1570749098976616529: "hi",
-}
+# Default channels are intentionally empty so each server manages its own channels dynamically in SQLite
+DEFAULT_CHANNELS: Dict[int, str] = {}
 
 def load_channel_mappings() -> Dict[int, str]:
     """

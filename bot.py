@@ -107,6 +107,30 @@ async def on_ready():
     await db_manager.seed_common_translations()
     await relay_manager.sync_channel_cache()
 
+    migrated_or_pruned = False
+    for channel_id, info in list(relay_manager.channels.items()):
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except discord.NotFound:
+                # Channel was permanently deleted in Discord while bot was offline
+                await db_manager.remove_channel(channel_id)
+                relay_manager.remove_channel_from_cache(channel_id)
+                migrated_or_pruned = True
+                print(f"🧹 Pruned deleted Discord channel ID {channel_id} from DB.")
+                continue
+            except Exception as e:
+                print(f"   • Channel ID {channel_id} -> Fetch skipped ({e})")
+                continue
+
+        if isinstance(channel, discord.TextChannel) and info.get("guild_id", 0) == 0:
+            await db_manager.migrate_channel_guild(channel_id, channel.guild.id)
+            migrated_or_pruned = True
+
+    if migrated_or_pruned:
+        await relay_manager.sync_channel_cache()
+
     if not database_prune_task.is_running():
         database_prune_task.start()
 
@@ -119,15 +143,27 @@ async def on_ready():
         lang = info["lang"].upper()
         mode = " [AI Romanized]" if info.get("is_romanized") else ""
         if isinstance(channel, discord.TextChannel):
-            wh = await relay_manager.get_or_create_webhook(channel)
             try:
-                # Pre-warm TLS connection pool to Discord webhook edge
-                await wh.fetch(prefer_auth=False)
-                print(f"   • #{channel.name} [{lang}]{mode} -> Webhook Ready & Pre-Warmed")
-            except Exception:
-                print(f"   • #{channel.name} [{lang}]{mode} -> Webhook Ready")
+                wh = await relay_manager.get_or_create_webhook(channel)
+                try:
+                    # Pre-warm TLS connection pool to Discord webhook edge
+                    await wh.fetch(prefer_auth=False)
+                    print(f"   • [{channel.guild.name}] #{channel.name} [{lang}]{mode} -> Webhook Ready & Pre-Warmed")
+                except Exception:
+                    print(f"   • [{channel.guild.name}] #{channel.name} [{lang}]{mode} -> Webhook Ready")
+            except Exception as e:
+                print(f"   • [{channel.guild.name}] #{channel.name} [{lang}]{mode} -> Webhook Setup Skipped ({e})")
         else:
             print(f"   • Channel ID {channel_id} [{lang}]{mode} -> Not cached or not TextChannel")
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    """Automatically unlinks a deleted Discord channel from only its own guild."""
+    if channel.id in relay_manager.channels:
+        removed = await db_manager.remove_channel(channel.id, guild_id=channel.guild.id)
+        relay_manager.remove_channel_from_cache(channel.id)
+        if removed:
+            print(f"🗑️ Auto-unlinked deleted channel #{channel.name} ({channel.id}) in guild '{channel.guild.name}'.")
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
@@ -162,6 +198,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             return
 
         translated_text = " ".join(translated_chunks)
+        if len(translated_text) > 4096:
+            translated_text = translated_text[:4093] + "..."
         embed = discord.Embed(
             title=f"{emoji_str} Translation ({target_lang.upper()})",
             description=translated_text,
@@ -195,21 +233,40 @@ async def on_message_delete(message: discord.Message):
 @app_commands.describe(
     channel="The text channel to link",
     language="The language spoken in this channel",
-    is_romanized="Whether users type in Romanized/slang script (e.g. Hinglish)"
+    is_romanized="Romanized/slang input (e.g. Hinglish/Bahasa Gaul); outbound slang currently targets Hindi",
+    group="Optional translation group name inside this server (default: 'default')"
 )
 @app_commands.choices(language=SUPPORTED_LANGUAGES)
 async def translate_add(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
     language: app_commands.Choice[str],
-    is_romanized: bool = False
+    is_romanized: bool = False,
+    group: str = "default"
 ):
-    """Links a channel to the translation network with optional Romanized AI processing."""
+    """Links a channel to this server's translation group with optional Romanized AI processing."""
     await interaction.response.defer(ephemeral=False)
+    if not interaction.guild:
+        await interaction.followup.send("❌ This command can only be used inside a Discord server.")
+        return
 
     lang_code = language.value.lower()
-    await db_manager.add_channel(channel.id, lang_code, is_romanized=is_romanized)
-    relay_manager.add_channel_to_cache(channel.id, lang_code, is_romanized)
+    guild_id = interaction.guild.id
+    scoped_group = db_manager.scoped_group_id(guild_id, group)
+    await db_manager.add_channel(
+        channel.id,
+        lang_code,
+        is_romanized=is_romanized,
+        group_id=group,
+        guild_id=guild_id
+    )
+    relay_manager.add_channel_to_cache(
+        channel.id,
+        lang_code,
+        is_romanized,
+        guild_id=guild_id,
+        group_id=scoped_group
+    )
 
     # Initialize webhook immediately
     try:
@@ -219,40 +276,72 @@ async def translate_add(
         wh_status = f"Warning: Could not create webhook ({e}). Check bot permissions."
 
     roman_tag = " *(AI Romanized Normalization Active)*" if is_romanized else ""
+    group_label = group.strip().lower() or "default"
     embed = discord.Embed(
         title="✅ Language Channel Linked",
-        description=f"Channel {channel.mention} is now linked to **{language.name}**{roman_tag}!\n{wh_status}",
+        description=f"Channel {channel.mention} is now linked to **{language.name}** in group **`{group_label}`**{roman_tag}!\n{wh_status}",
         color=0x2ECC71
     )
     await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="translate-remove", description="Unlink a channel from the translation network.")
+@bot.tree.command(name="translate-remove", description="Unlink a channel from this server's translation network.")
 @app_commands.default_permissions(manage_channels=True)
 @app_commands.describe(channel="The channel to unlink")
 async def translate_remove(interaction: discord.Interaction, channel: discord.TextChannel):
-    """Removes a channel from the translation network."""
+    """Removes a channel from this server's translation network."""
     await interaction.response.defer(ephemeral=False)
+    guild_id = interaction.guild_id
 
-    removed = await db_manager.remove_channel(channel.id)
+    removed = await db_manager.remove_channel(channel.id, guild_id=guild_id)
     relay_manager.remove_channel_from_cache(channel.id)
 
     if removed:
         embed = discord.Embed(
             title="🗑️ Channel Unlinked",
-            description=f"Channel {channel.mention} has been removed from the translation network.",
+            description=f"Channel {channel.mention} has been removed from **{interaction.guild.name if interaction.guild else 'this server'}**'s translation network.",
             color=0xE74C3C
         )
     else:
         embed = discord.Embed(
             title="⚠️ Channel Not Found",
-            description=f"Channel {channel.mention} was not found in active channels.",
+            description=f"Channel {channel.mention} was not found in this server's active channels.",
             color=0xF1C40F
+        )
+    await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="translate-reset", description="Unlinks all translation channels (or one group) in THIS server only.")
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.describe(group="Optional group name to reset (leave blank to reset all groups in this server)")
+async def translate_reset(interaction: discord.Interaction, group: Optional[str] = None):
+    """Safely unlinks all translation channels for the current server without affecting other servers."""
+    await interaction.response.defer(ephemeral=False)
+    if not interaction.guild:
+        await interaction.followup.send("❌ This command can only be used inside a Discord server.")
+        return
+
+    removed_ids = await db_manager.remove_guild_channels(interaction.guild.id, group_name=group)
+    for cid in removed_ids:
+        relay_manager.remove_channel_from_cache(cid)
+
+    scope_desc = f"group **`{group}`** in " if group else ""
+    if removed_ids:
+        embed = discord.Embed(
+            title="🧹 Server Translation Links Cleared",
+            description=f"Unlinked **{len(removed_ids)}** channel(s) from {scope_desc}**{interaction.guild.name}**.\nOther servers were not affected.",
+            color=0xE74C3C
+        )
+    else:
+        embed = discord.Embed(
+            title="ℹ️ Nothing to Reset",
+            description=f"No configured translation channels were found for {scope_desc}**{interaction.guild.name}**.",
+            color=0x3498DB
         )
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="translate-setup", description="1-Click Wizard: Automatically creates category and paired language channels.")
 @app_commands.default_permissions(manage_channels=True)
-async def translate_setup(interaction: discord.Interaction):
+@app_commands.describe(group="Optional group name for these channels inside this server (default: 'default')")
+async def translate_setup(interaction: discord.Interaction, group: str = "default"):
     """Automatically creates a '🌍 Polyglot Network' category with #english, #spanish, #japanese, #hindi."""
     await interaction.response.defer(ephemeral=False)
     guild = interaction.guild
@@ -266,9 +355,11 @@ async def translate_setup(interaction: discord.Interaction):
         return
 
     try:
-        category = discord.utils.get(guild.categories, name="🌍 Polyglot Network")
+        clean_group = (group or "default").strip().lower() or "default"
+        category_name = "🌍 Polyglot Network" if clean_group == "default" else f"🌍 Polyglot ({clean_group})"
+        category = discord.utils.get(guild.categories, name=category_name)
         if not category:
-            category = await guild.create_category("🌍 Polyglot Network")
+            category = await guild.create_category(category_name)
 
         preset_channels = [
             ("english", "en", False),
@@ -277,21 +368,34 @@ async def translate_setup(interaction: discord.Interaction):
             ("hindi", "hi", True),
         ]
 
+        scoped_group = db_manager.scoped_group_id(guild.id, clean_group)
         created_info = []
         for ch_name, lang_code, is_romanized in preset_channels:
             ch = discord.utils.get(category.text_channels, name=ch_name)
             if not ch:
                 ch = await category.create_text_channel(name=ch_name)
 
-            await db_manager.add_channel(ch.id, lang_code, is_romanized=is_romanized)
-            relay_manager.add_channel_to_cache(ch.id, lang_code, is_romanized)
+            await db_manager.add_channel(
+                ch.id,
+                lang_code,
+                is_romanized=is_romanized,
+                group_id=clean_group,
+                guild_id=guild.id
+            )
+            relay_manager.add_channel_to_cache(
+                ch.id,
+                lang_code,
+                is_romanized,
+                guild_id=guild.id,
+                group_id=scoped_group
+            )
             await relay_manager.get_or_create_webhook(ch)
             roman_note = " *(AI Romanized)*" if is_romanized else ""
             created_info.append(f"• {ch.mention} [**{lang_code.upper()}**]{roman_note}")
 
         embed = discord.Embed(
-            title="🎉 Polyglot Network Configured!",
-            description="The translation network has been automatically set up:\n\n" + "\n".join(created_info) + "\n\nAny message sent in one of these channels will automatically relay and translate to the others!",
+            title=f"🎉 Polyglot Network Configured ({guild.name})!",
+            description=f"Group **`{clean_group}`** has been set up for this server:\n\n" + "\n".join(created_info) + "\n\nAny message sent in one of these channels will automatically relay and translate to the others!",
             color=0x2ECC71
         )
         embed.set_footer(text="Ready to chat! Use // at start of message to opt-out.")
@@ -398,6 +502,12 @@ async def view_original_text(interaction: discord.Interaction, message: discord.
     created_at_str = "Unknown"
 
     if isinstance(src_channel, discord.TextChannel):
+        if interaction.guild and src_channel.guild.id != interaction.guild.id:
+            await interaction.followup.send(
+                "ℹ️ Original message belongs to a different server and cannot be viewed here.",
+                ephemeral=True
+            )
+            return
         try:
             src_msg = await src_channel.fetch_message(src_message_id)
             original_author = src_msg.author.display_name
@@ -421,9 +531,14 @@ async def view_original_text(interaction: discord.Interaction, message: discord.
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="translate-status", description="Displays Polyglot translation bot health, channels, and metrics.")
+@bot.tree.command(name="translate-status", description="Displays Polyglot translation bot health, channels, and metrics for this server.")
 async def translate_status(interaction: discord.Interaction):
-    """Slash command to display bot status, ping, channels, and statistics."""
+    """Slash command to display bot status, ping, this server's channels, and statistics."""
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("❌ This command can only be used inside a Discord server.", ephemeral=True)
+        return
+
     uptime_seconds = int(time.time() - start_time)
     hours, remainder = divmod(uptime_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -432,7 +547,7 @@ async def translate_status(interaction: discord.Interaction):
     latency_ms = round(bot.latency * 1000, 1)
 
     embed = discord.Embed(
-        title="🌐 Polyglot Translator Dashboard",
+        title=f"🌐 Polyglot Dashboard — {guild.name}",
         color=0x2ECC71
     )
     embed.add_field(name="Bot Status", value="🟢 Online & Relaying", inline=True)
@@ -441,16 +556,19 @@ async def translate_status(interaction: discord.Interaction):
 
     channel_lines = []
     for cid, info in relay_manager.channels.items():
-        ch = bot.get_channel(cid)
-        name = ch.name if ch else "channel"
+        ch = guild.get_channel(cid)
+        if not ch or not isinstance(ch, discord.TextChannel):
+            continue
+        raw_group = info.get("group_id", "default")
+        group_label = raw_group.split(":", 1)[-1] if ":" in raw_group else raw_group
         roman = " *(AI Romanized)*" if info.get("is_romanized") else ""
-        channel_lines.append(f"• **{info['lang'].upper()}**: <#{cid}> (`#{name}`){roman}")
-    channels_display = "\n".join(channel_lines) if channel_lines else "No channels configured."
+        channel_lines.append(f"• **{info['lang'].upper()}**: <#{cid}> (`#{ch.name}` | group: `{group_label}`){roman}")
+    channels_display = "\n".join(channel_lines) if channel_lines else "No channels configured in this server."
 
-    embed.add_field(name="Active Language Channels", value=channels_display, inline=False)
+    embed.add_field(name=f"Active Language Channels ({len(channel_lines)})", value=channels_display, inline=False)
 
     stats = translator_service.stats
-    db_stats = await db_manager.get_stats()
+    db_stats = await db_manager.get_stats(guild_id=guild.id)
     ai_stats = relay_manager.normalizer.stats
 
     total_tr = stats.get("total_translated", 0)
@@ -509,12 +627,14 @@ async def translate_latency(
     else:
         src_lang = "en"
 
-    # 2. Determine Destination Channel & Target Language
+    # 2. Determine Destination Channel & Target Language (strictly within the same guild & group)
     dest_channel = target_channel
+    src_group = src_info.get("group_id", "default") if src_info else None
     if not dest_channel:
-        # Find another active channel in this server
         for cid, info in relay_manager.channels.items():
             if cid != interaction.channel_id:
+                if src_group and info.get("group_id", "default") != src_group:
+                    continue
                 candidate = guild.get_channel(cid)
                 if isinstance(candidate, discord.TextChannel):
                     dest_channel = candidate
@@ -719,15 +839,15 @@ async def translate_ping(
 
 async def setup_bot():
     """Initializes command trees and event loops."""
-    async with bot:
-        @bot.event
-        async def on_connect():
-            try:
-                synced = await bot.tree.sync()
-                print(f"Synced {len(synced)} application commands.")
-            except Exception as e:
-                print(f"Failed to sync application commands: {e}")
+    async def setup_hook():
+        try:
+            synced = await bot.tree.sync()
+            print(f"Synced {len(synced)} application commands.")
+        except Exception as e:
+            print(f"Failed to sync application commands: {e}")
 
+    bot.setup_hook = setup_hook
+    async with bot:
         try:
             await bot.start(DISCORD_TOKEN)
         finally:

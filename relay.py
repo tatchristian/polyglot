@@ -9,7 +9,7 @@ from config import (
     COMMAND_PREFIXES,
     MAX_CONCURRENT_RELAYS,
 )
-from translator import TranslationService, shield_syntax, restore_syntax, is_passthrough_text
+from translator import TranslationService, shield_syntax, restore_syntax, is_passthrough_text, chunk_message
 from database import DatabaseManager
 from hinglish_gatekeeper import is_potential_hinglish, is_already_english
 from slang_normalizer import SlangNormalizer, HinglishNormalizer, has_native_script
@@ -56,7 +56,7 @@ class WebhookRelayManager:
         self.message_lru = LRUMessageMap(maxsize=1000)
         self.anti_spam = AntiSpamManager()
         self.webhooks: Dict[int, discord.Webhook] = {}
-        # Dynamic channels dictionary: channel_id -> {"lang": str, "is_romanized": bool}
+        # Dynamic channels dictionary: channel_id -> {"lang": str, "is_romanized": bool, "guild_id": int, "group_id": str}
         self.channels: Dict[int, Dict[str, Any]] = {}
         self.safe_mentions = discord.AllowedMentions.none()
 
@@ -64,12 +64,62 @@ class WebhookRelayManager:
         """Loads active channels and their Romanized settings from SQLite into memory."""
         self.channels = await self.db.get_active_channels()
 
-    def add_channel_to_cache(self, channel_id: int, lang: str, is_romanized: bool):
+    def add_channel_to_cache(
+        self,
+        channel_id: int,
+        lang: str,
+        is_romanized: bool,
+        guild_id: int = 0,
+        group_id: str = "default"
+    ):
         """Immediately updates memory cache when a channel is added via slash command."""
         self.channels[channel_id] = {
             "lang": lang,
-            "is_romanized": is_romanized
+            "is_romanized": is_romanized,
+            "guild_id": guild_id,
+            "group_id": group_id,
         }
+
+    async def _normalize_romanized_cached(
+        self,
+        shielded_text: str,
+        source_lang: str,
+        parent_context: Optional[str] = None,
+        retry_without_context: bool = False
+    ) -> Optional[str]:
+        """Normalizes Romanized slang to English with L1/L2 cache lookup when context-free."""
+        cache_src = f"{source_lang}_roman"
+        if not parent_context:
+            cached = await self.translator.lookup_cache(cache_src, "en", shielded_text)
+            if not cached and source_lang == "hi":
+                cached = await self.translator.lookup_cache("hi", "en", shielded_text)
+            if cached:
+                return cached
+
+        raw_normalized = await self.normalizer.normalize_hinglish(
+            shielded_text,
+            parent_context=parent_context
+        )
+        if not raw_normalized and retry_without_context and parent_context:
+            raw_normalized = await self.normalizer.normalize_hinglish(shielded_text)
+
+        if raw_normalized and not parent_context:
+            await self.translator._save_translation(cache_src, "en", shielded_text, raw_normalized)
+        return raw_normalized
+
+    async def _to_romanized_cached(self, shielded_en: str, target_lang: str = "hi") -> Optional[str]:
+        """Converts English to Romanized Hinglish with L1/L2 cache lookup."""
+        cache_target = f"{target_lang}_roman"
+        cached = await self.translator.lookup_cache("en", cache_target, shielded_en)
+        if not cached and target_lang == "hi":
+            cached = await self.translator.lookup_cache("en", "hi", shielded_en)
+        if cached:
+            return cached
+
+        romanized_raw = await self.normalizer.to_romanized_hindi(shielded_en)
+        if romanized_raw:
+            await self.translator._save_translation("en", cache_target, shielded_en, romanized_raw)
+        return romanized_raw
 
     def remove_channel_from_cache(self, channel_id: int):
         """Removes channel from cache and closes webhook if cached."""
@@ -154,6 +204,66 @@ class WebhookRelayManager:
         snippet = clean_content.replace("\n", " ").strip()
         return author_name, snippet, parent_uuid
 
+    async def _render_target_chunks(
+        self,
+        text: str,
+        source_lang: str,
+        target_lang: str,
+        is_target_romanized: bool = False,
+        normalized_english: Optional[str] = None,
+        is_source_romanized: bool = False,
+        shield_source: bool = False
+    ) -> List[str]:
+        """Renders translated text chunks for a target channel, preserving syntax shielding."""
+        if not text:
+            return [""]
+        if is_passthrough_text(text):
+            return [text]
+
+        base_english = normalized_english
+        if base_english is None and shield_source and is_source_romanized and not has_native_script(text):
+            shielded_in, in_tokens = shield_syntax(text)
+            raw_norm = await self._normalize_romanized_cached(shielded_in, source_lang=source_lang)
+            if raw_norm:
+                base_english = restore_syntax(raw_norm, in_tokens)
+
+        if target_lang == "hi" and is_target_romanized:
+            if not base_english:
+                if source_lang == "en":
+                    base_english = text
+                else:
+                    en_chunks = await self.translator.translate(
+                        text=text,
+                        source_lang=source_lang,
+                        target_lang="en"
+                    )
+                    base_english = en_chunks[0] if en_chunks else text
+
+            shielded_en, en_tokens = shield_syntax(base_english)
+            romanized_raw = await self._to_romanized_cached(shielded_en, target_lang="hi")
+            if romanized_raw:
+                return chunk_message(restore_syntax(romanized_raw, en_tokens))
+            return await self.translator.translate(
+                text=base_english,
+                source_lang="en",
+                target_lang="hi"
+            )
+
+        if base_english:
+            if target_lang == "en":
+                return chunk_message(base_english)
+            return await self.translator.translate(
+                text=base_english,
+                source_lang="en",
+                target_lang=target_lang
+            )
+
+        return await self.translator.translate(
+            text=text,
+            source_lang=source_lang,
+            target_lang=target_lang
+        )
+
     async def _translate_snippet(
         self,
         raw_snippet: str,
@@ -166,36 +276,15 @@ class WebhookRelayManager:
         if not raw_snippet:
             return ""
 
-        # Normalize source to base English
-        base_en = None
-        if is_source_romanized and not has_native_script(raw_snippet):
-            base_en = await self.normalizer.normalize_hinglish(raw_snippet)
-
-        if not base_en:
-            if source_lang == "en":
-                base_en = raw_snippet
-            else:
-                en_chunks = await self.translator.translate(
-                    text=raw_snippet,
-                    source_lang=source_lang,
-                    target_lang="en"
-                )
-                base_en = en_chunks[0] if en_chunks else raw_snippet
-
-        # Render into target language
-        if target_lang == "en":
-            translated = base_en
-        elif target_lang == "hi" and is_target_romanized:
-            roman_raw = await self.normalizer.to_romanized_hindi(base_en)
-            translated = roman_raw if roman_raw else base_en
-        else:
-            chunks = await self.translator.translate(
-                text=base_en,
-                source_lang="en",
-                target_lang=target_lang
-            )
-            translated = chunks[0] if chunks else base_en
-
+        chunks = await self._render_target_chunks(
+            text=raw_snippet,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            is_target_romanized=is_target_romanized,
+            is_source_romanized=is_source_romanized,
+            shield_source=True
+        )
+        translated = chunks[0] if chunks else raw_snippet
         if len(translated) > 60:
             translated = translated[:57] + "..."
         return translated
@@ -261,8 +350,10 @@ class WebhookRelayManager:
 
         normalized_english = None
 
-        # Check Romanized Flag or Heuristic Gatekeeper
-        should_use_ai = is_romanized_channel or is_potential_hinglish(text_to_translate, source_lang)
+        # Check Romanized Flag or Heuristic Gatekeeper (only on English/Hindi channels to avoid false positives)
+        should_use_ai = is_romanized_channel or (
+            source_lang in ("en", "hi") and is_potential_hinglish(text_to_translate, source_lang)
+        )
         if is_passthrough_text(text_to_translate):
             should_use_ai = False
         elif has_native_script(text_to_translate):
@@ -283,13 +374,12 @@ class WebhookRelayManager:
 
             # Shield mentions, emojis, game brands, and code tokens so AI doesn't mangle user IDs
             shielded_input, in_tokens = shield_syntax(text_to_translate)
-            raw_normalized = await self.normalizer.normalize_hinglish(
+            raw_normalized = await self._normalize_romanized_cached(
                 shielded_input,
-                parent_context=parent_context
+                source_lang=source_lang,
+                parent_context=parent_context,
+                retry_without_context=is_romanized_channel
             )
-            if not raw_normalized and is_romanized_channel:
-                # Retry once without parent context if first attempt timed out
-                raw_normalized = await self.normalizer.normalize_hinglish(shielded_input)
 
             if raw_normalized:
                 normalized_english = restore_syntax(raw_normalized, in_tokens)
@@ -308,46 +398,13 @@ class WebhookRelayManager:
             target_lang = dest_info["lang"]
 
             async def compute_chunks() -> List[str]:
-                if not text_to_translate:
-                    return [""]
-                if is_passthrough_text(text_to_translate):
-                    return [text_to_translate]
-                # If target channel is configured as Romanized Hindi, deliver conversational Hinglish
-                if target_lang == "hi" and dest_info.get("is_romanized", False):
-                    base_english = normalized_english
-                    if not base_english:
-                        en_chunks = await self.translator.translate(
-                            text=text_to_translate,
-                            source_lang=source_lang,
-                            target_lang="en"
-                        )
-                        base_english = en_chunks[0] if en_chunks else text_to_translate
-
-                    shielded_en, en_tokens = shield_syntax(base_english)
-                    romanized_raw = await self.normalizer.to_romanized_hindi(shielded_en)
-                    if romanized_raw:
-                        return [restore_syntax(romanized_raw, en_tokens)]
-                    else:
-                        return await self.translator.translate(
-                            text=base_english,
-                            source_lang="en",
-                            target_lang="hi"
-                        )
-                elif normalized_english:
-                    if target_lang == "en":
-                        return [normalized_english]
-                    else:
-                        return await self.translator.translate(
-                            text=normalized_english,
-                            source_lang="en",
-                            target_lang=target_lang
-                        )
-                else:
-                    return await self.translator.translate(
-                        text=text_to_translate,
-                        source_lang=source_lang,
-                        target_lang=target_lang
-                    )
+                return await self._render_target_chunks(
+                    text=text_to_translate,
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    is_target_romanized=dest_info.get("is_romanized", False),
+                    normalized_english=normalized_english
+                )
 
             async def compute_reply_header() -> str:
                 if not reply_author:
@@ -364,22 +421,23 @@ class WebhookRelayManager:
             # Parallelize main text translation and reply snippet translation
             chunks, reply_header = await asyncio.gather(compute_chunks(), compute_reply_header())
 
-            if reply_header and chunks:
-                chunks[0] = reply_header + chunks[0]
-
+            full_content = (reply_header + "\n".join(chunks)) if chunks else reply_header
             if attachment_text:
-                if chunks:
-                    chunks[-1] += attachment_text
-                else:
-                    chunks = [attachment_text.strip()]
+                full_content = (full_content + attachment_text) if full_content else attachment_text.strip()
+            chunks = chunk_message(full_content) if full_content else []
 
-            wh = await self.get_or_create_webhook(dest_channel)
             if hasattr(message.author.display_avatar, "with_size"):
                 author_avatar = message.author.display_avatar.with_size(64).url
             else:
                 author_avatar = message.author.display_avatar.url
 
             async with self.semaphore:
+                try:
+                    wh = await self.get_or_create_webhook(dest_channel)
+                except Exception as e:
+                    print(f"Error obtaining webhook for #{dest_channel.name}: {e}")
+                    return
+
                 for chunk in chunks:
                     if not chunk.strip():
                         continue
@@ -395,11 +453,15 @@ class WebhookRelayManager:
                     except Exception as e:
                         print(f"Error relaying to #{dest_channel.name}: {e}")
 
-        # Fan-out to all destination channels simultaneously in parallel
+        # Fan-out only to destination channels in the SAME server AND translation group
+        src_group = channel_info.get("group_id", "default")
+        src_guild = channel_info.get("guild_id") or (message.guild.id if message.guild else 0)
         delivery_tasks = [
             deliver_to_channel(dest_id, dest_info)
             for dest_id, dest_info in self.channels.items()
             if dest_id != message.channel.id
+            and dest_info.get("group_id", "default") == src_group
+            and (not src_guild or not dest_info.get("guild_id") or dest_info.get("guild_id") == src_guild)
         ]
         if delivery_tasks:
             await asyncio.gather(*delivery_tasks)
@@ -416,6 +478,8 @@ class WebhookRelayManager:
 
     async def handle_message_edit(self, before: discord.Message, after: discord.Message):
         """Synchronizes message edits to relayed webhook messages via SQLite records."""
+        if before.content == after.content:
+            return
         if not self.should_process_message(after):
             return
 
@@ -434,7 +498,7 @@ class WebhookRelayManager:
         normalized_english = None
         if is_source_romanized and not has_native_script(updated_text):
             shielded_input, in_tokens = shield_syntax(updated_text)
-            raw_normalized = await self.normalizer.normalize_hinglish(shielded_input)
+            raw_normalized = await self._normalize_romanized_cached(shielded_input, source_lang=source_lang)
             if raw_normalized:
                 normalized_english = restore_syntax(raw_normalized, in_tokens)
 
@@ -456,33 +520,13 @@ class WebhookRelayManager:
             target_lang = dest_info["lang"]
             is_target_romanized = dest_info.get("is_romanized", False)
 
-            if target_lang == "hi" and is_target_romanized:
-                base_en = normalized_english
-                if not base_en:
-                    en_chunks = await self.translator.translate(
-                        text=updated_text,
-                        source_lang=source_lang,
-                        target_lang="en"
-                    )
-                    base_en = en_chunks[0] if en_chunks else updated_text
-                shielded_en, en_tokens = shield_syntax(base_en)
-                romanized = await self.normalizer.to_romanized_hindi(shielded_en)
-                chunks = [restore_syntax(romanized, en_tokens)] if romanized else [base_en]
-            elif normalized_english:
-                if target_lang == "en":
-                    chunks = [normalized_english]
-                else:
-                    chunks = await self.translator.translate(
-                        text=normalized_english,
-                        source_lang="en",
-                        target_lang=target_lang
-                    )
-            else:
-                chunks = await self.translator.translate(
-                    text=updated_text,
-                    source_lang=source_lang,
-                    target_lang=target_lang
-                )
+            chunks = await self._render_target_chunks(
+                text=updated_text,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                is_target_romanized=is_target_romanized,
+                normalized_english=normalized_english
+            )
             if not chunks:
                 return
 
@@ -497,11 +541,12 @@ class WebhookRelayManager:
                     is_source_romanized=channel_info.get("is_romanized", False)
                 )
 
-            content_to_send = (reply_header + chunks[0]) if reply_header else chunks[0]
+            full_edit = (reply_header + "\n".join(chunks)) if reply_header else "\n".join(chunks)
+            content_to_send = chunk_message(full_edit)[0]
 
-            wh = await self.get_or_create_webhook(dest_channel)
             async with self.semaphore:
                 try:
+                    wh = await self.get_or_create_webhook(dest_channel)
                     await wh.edit_message(webhook_msg_id, content=content_to_send, allowed_mentions=self.safe_mentions)
                 except Exception as e:
                     print(f"Error updating edited message in #{dest_channel.name}: {e}")
@@ -530,9 +575,9 @@ class WebhookRelayManager:
             if message.guild and dest_channel.guild.id != message.guild.id:
                 return
 
-            wh = await self.get_or_create_webhook(dest_channel)
             async with self.semaphore:
                 try:
+                    wh = await self.get_or_create_webhook(dest_channel)
                     await wh.delete_message(webhook_msg_id)
                 except Exception as e:
                     print(f"Error deleting relayed message in #{dest_channel.name}: {e}")

@@ -42,8 +42,8 @@
 
 | File | Primary Responsibility | Key Classes / Functions | Depends On |
 | :--- | :--- | :--- | :--- |
-| **`bot.py`** | Bot bootstrap, Discord gateway events, slash commands (`/translate-add`, `/translate-remove`, `/translate-setup`, `/translate-doctor`, `/translate-status`, `/translate-latency`, `/translate-ping`), `View Original Text` context menu, flag emoji reactions, 60-day pruning task. | `bot`, `translate_setup()`, `translate_doctor()`, `translate_latency()`, `translate_ping()`, `view_original_text()`, `on_raw_reaction_add()` | `config`, `database`, `translator`, `relay` |
-| **`relay.py`** | Cross-channel fan-out, webhook lifecycle/caching, reply context localization, edit/delete synchronization, loop avoidance, `//` privacy opt-out prefix. | `WebhookRelayManager`, `LRUMessageMap`, `relay_message()`, `sync_edit()`, `sync_delete()` | `database`, `translator`, `slang_normalizer`, `hinglish_gatekeeper`, `spam_filter` |
+| **`bot.py`** | Bot bootstrap, Discord gateway events (`on_guild_channel_delete` auto-cleanup), guild-scoped slash commands (`/translate-add`, `/translate-remove`, `/translate-reset`, `/translate-setup`, `/translate-doctor`, `/translate-status`, `/translate-latency`, `/translate-ping`), `View Original Text` context menu, flag emoji reactions, 60-day pruning task. | `bot`, `translate_setup()`, `translate_reset()`, `translate_doctor()`, `translate_latency()`, `translate_ping()`, `view_original_text()`, `on_guild_channel_delete()` | `config`, `database`, `translator`, `relay` |
+| **`relay.py`** | Guild & group-isolated cross-channel fan-out, L1/L2 cached Romanized normalization, webhook lifecycle/caching, reply context localization, edit/delete synchronization, loop avoidance, `//` privacy opt-out prefix. | `WebhookRelayManager`, `LRUMessageMap`, `relay_message()`, `_normalize_romanized_cached()`, `sync_edit()`, `sync_delete()` | `database`, `translator`, `slang_normalizer`, `hinglish_gatekeeper`, `spam_filter` |
 | **`spam_filter.py`** | Anti-spam and meaningless message protection: duplicate bursts, keyboard smashes, repetitive word loops, newline bombs. | `AntiSpamManager`, `is_spam_or_meaningless()`, `is_meaningless_text()` | *Standard Library* |
 | **`translator.py`** | Strict priority cascade (`rotate=False`), circuit breakers, 2-tier caching with negation-safe fuzzy fallback (`difflib`), syntax & game brand shielding, Google `gtx` public client, message chunking (<2000 chars). | `TranslationService`, `CircuitBreaker`, `is_passthrough_text()`, `shield_syntax()`, `restore_syntax()`, `chunk_message()`, `extract_negation_words()`, `googleapis_translate()` | `config`, `database`, `slang_normalizer` |
 | **`database.py`** | Async SQLite persistence (`aiosqlite`) with WAL mode, channel mappings, conversation UUID tracking, L2 translation cache with bounded fuzzy fallback, 60-day sync pruning, and pre-seeded common phrase corpus. | `DatabaseManager`, `get_cached_translation()`, `set_cached_translation()`, `seed_common_translations()`, `prune_old_sync_records()` | `aiosqlite` |
@@ -59,9 +59,10 @@
 Engine: **SQLite 3** operating in **WAL (Write-Ahead Logging)** mode for high concurrency.
 
 ```sql
--- 1. Logical translation groups
+-- 1. Logical translation groups (scoped per Discord guild)
 CREATE TABLE translation_groups (
     group_id TEXT PRIMARY KEY,
+    guild_id INTEGER DEFAULT 0,
     name TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -70,6 +71,7 @@ CREATE TABLE translation_groups (
 CREATE TABLE group_channels (
     channel_id INTEGER PRIMARY KEY,
     group_id TEXT NOT NULL,
+    guild_id INTEGER DEFAULT 0,
     language_code TEXT NOT NULL,
     is_romanized INTEGER DEFAULT 0,
     FOREIGN KEY (group_id) REFERENCES translation_groups(group_id) ON DELETE CASCADE

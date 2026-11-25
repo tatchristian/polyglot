@@ -14,7 +14,9 @@ class DatabaseManager:
         self._conn: Optional[aiosqlite.Connection] = None
 
     async def connect(self):
-        """Initializes connection and configures Write-Ahead Logging (WAL) for high concurrency."""
+        """Initializes connection once and configures Write-Ahead Logging (WAL) for high concurrency."""
+        if self._conn is not None:
+            return
         self._conn = await aiosqlite.connect(self.db_path)
         await self._conn.execute("PRAGMA journal_mode=WAL;")
         await self._conn.execute("PRAGMA synchronous=NORMAL;")
@@ -24,6 +26,7 @@ class DatabaseManager:
         """Closes database connection gracefully."""
         if self._conn:
             await self._conn.close()
+            self._conn = None
 
     async def _create_tables(self):
         """Creates tables, adds missing columns safely, and builds indexes."""
@@ -32,10 +35,16 @@ class DatabaseManager:
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS translation_groups (
                 group_id TEXT PRIMARY KEY,
+                guild_id INTEGER DEFAULT 0,
                 name TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+
+        try:
+            await self._conn.execute("ALTER TABLE translation_groups ADD COLUMN guild_id INTEGER DEFAULT 0;")
+        except Exception:
+            pass  # Column already exists
 
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS translation_cache (
@@ -52,17 +61,29 @@ class DatabaseManager:
             CREATE TABLE IF NOT EXISTS group_channels (
                 channel_id INTEGER PRIMARY KEY,
                 group_id TEXT NOT NULL,
+                guild_id INTEGER DEFAULT 0,
                 language_code TEXT NOT NULL,
                 is_romanized INTEGER DEFAULT 0,
                 FOREIGN KEY(group_id) REFERENCES translation_groups(group_id)
             );
         """)
 
-        # Migration check: Ensure is_romanized exists if table was created previously
-        try:
-            await self._conn.execute("ALTER TABLE group_channels ADD COLUMN is_romanized INTEGER DEFAULT 0;")
-        except Exception:
-            pass  # Column already exists
+        # Migration checks: Ensure is_romanized and guild_id exist if table was created previously
+        for col_sql in (
+            "ALTER TABLE group_channels ADD COLUMN is_romanized INTEGER DEFAULT 0;",
+            "ALTER TABLE group_channels ADD COLUMN guild_id INTEGER DEFAULT 0;",
+        ):
+            try:
+                await self._conn.execute(col_sql)
+            except Exception:
+                pass  # Column already exists
+
+        await self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_group_channels_guild ON group_channels(guild_id, group_id);
+        """)
+        await self._conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_cache_lookup ON translation_cache(source_lang, target_lang, created_at DESC);
+        """)
 
         await self._conn.execute("""
             CREATE TABLE IF NOT EXISTS message_sync (
@@ -112,59 +133,158 @@ class DatabaseManager:
         """)
         await self._conn.commit()
 
-    async def seed_default_channels(self, channels: Dict[int, str]):
+    @staticmethod
+    def scoped_group_id(guild_id: int, group_name: str = "default") -> str:
+        """Builds a server-scoped group key so groups never collide across Discord servers."""
+        clean_name = (group_name or "default").strip().lower() or "default"
+        if guild_id and not clean_name.startswith(f"{guild_id}:"):
+            return f"{guild_id}:{clean_name}"
+        return clean_name
+
+    async def seed_default_channels(self, channels: Dict[int, str], guild_id: int = 0):
         """Seeds default channels if tables are empty."""
         assert self._conn is not None
         if not channels:
             return
 
-        async with self._conn.execute("SELECT COUNT(*) FROM translation_groups;") as cursor:
+        effective_group = self.scoped_group_id(guild_id, "default")
+        async with self._conn.execute("SELECT COUNT(*) FROM translation_groups WHERE group_id = ?;", (effective_group,)) as cursor:
             row = await cursor.fetchone()
             if row and row[0] == 0:
                 await self._conn.execute(
-                    "INSERT INTO translation_groups (group_id, name) VALUES (?, ?);",
-                    ("default", "Primary General Channels")
+                    "INSERT INTO translation_groups (group_id, guild_id, name) VALUES (?, ?, ?);",
+                    (effective_group, guild_id, "Primary General Channels")
                 )
 
         for channel_id, lang in channels.items():
             is_rom = 1 if lang.lower() == "hi" else 0
             await self._conn.execute("""
-                INSERT OR IGNORE INTO group_channels (channel_id, group_id, language_code, is_romanized)
-                VALUES (?, ?, ?, ?);
-            """, (channel_id, "default", lang, is_rom))
+                INSERT OR IGNORE INTO group_channels (channel_id, group_id, guild_id, language_code, is_romanized)
+                VALUES (?, ?, ?, ?, ?);
+            """, (channel_id, effective_group, guild_id, lang, is_rom))
 
         await self._conn.commit()
 
-    async def add_channel(self, channel_id: int, language_code: str, is_romanized: bool = False, group_id: str = "default"):
-        """Adds or updates a channel mapping dynamically."""
+    async def add_channel(
+        self,
+        channel_id: int,
+        language_code: str,
+        is_romanized: bool = False,
+        group_id: str = "default",
+        guild_id: int = 0
+    ):
+        """Adds or updates a guild-scoped channel mapping dynamically."""
         assert self._conn is not None
-        # Ensure default group exists
+        clean_group_name = (group_id or "default").strip().lower() or "default"
+        effective_group = self.scoped_group_id(guild_id, clean_group_name)
+        friendly_name = "Primary General Channels" if clean_group_name == "default" else clean_group_name
+
         await self._conn.execute(
-            "INSERT OR IGNORE INTO translation_groups (group_id, name) VALUES (?, ?);",
-            (group_id, "Primary General Channels")
+            "INSERT OR IGNORE INTO translation_groups (group_id, guild_id, name) VALUES (?, ?, ?);",
+            (effective_group, guild_id, friendly_name)
         )
         await self._conn.execute("""
-            INSERT OR REPLACE INTO group_channels (channel_id, group_id, language_code, is_romanized)
-            VALUES (?, ?, ?, ?);
-        """, (channel_id, group_id, language_code.lower(), 1 if is_romanized else 0))
+            INSERT OR REPLACE INTO group_channels (channel_id, group_id, guild_id, language_code, is_romanized)
+            VALUES (?, ?, ?, ?, ?);
+        """, (channel_id, effective_group, guild_id, language_code.lower(), 1 if is_romanized else 0))
         await self._conn.commit()
 
-    async def remove_channel(self, channel_id: int) -> bool:
-        """Removes a channel mapping dynamically."""
+    async def migrate_channel_guild(self, channel_id: int, guild_id: int):
+        """Assigns a guild_id and server-scoped group_id to legacy un-scoped channel rows."""
         assert self._conn is not None
-        async with self._conn.execute("DELETE FROM group_channels WHERE channel_id = ?;", (channel_id,)) as cursor:
+        if not guild_id:
+            return
+        async with self._conn.execute(
+            "SELECT group_id, guild_id FROM group_channels WHERE channel_id = ?;",
+            (channel_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return
+
+        current_group, current_guild = row[0], row[1] or 0
+        if current_guild == guild_id and current_group.startswith(f"{guild_id}:"):
+            return
+
+        base_name = current_group.split(":", 1)[-1] if ":" in current_group else current_group
+        new_group = self.scoped_group_id(guild_id, base_name)
+        friendly_name = "Primary General Channels" if base_name == "default" else base_name
+
+        await self._conn.execute(
+            "INSERT OR IGNORE INTO translation_groups (group_id, guild_id, name) VALUES (?, ?, ?);",
+            (new_group, guild_id, friendly_name)
+        )
+        await self._conn.execute(
+            "UPDATE group_channels SET guild_id = ?, group_id = ? WHERE channel_id = ?;",
+            (guild_id, new_group, channel_id)
+        )
+        await self._conn.commit()
+
+    async def remove_channel(self, channel_id: int, guild_id: Optional[int] = None) -> bool:
+        """Removes a channel mapping dynamically, optionally guarded by guild_id."""
+        assert self._conn is not None
+        if guild_id is not None:
+            sql = "DELETE FROM group_channels WHERE channel_id = ? AND (guild_id = ? OR guild_id = 0);"
+            params: Tuple[Any, ...] = (channel_id, guild_id)
+        else:
+            sql = "DELETE FROM group_channels WHERE channel_id = ?;"
+            params = (channel_id,)
+
+        async with self._conn.execute(sql, params) as cursor:
             await self._conn.commit()
             return cursor.rowcount > 0
 
-    async def get_active_channels(self) -> Dict[int, Dict[str, Any]]:
-        """Returns all configured channel IDs, their language codes, and romanized flags."""
+    async def remove_guild_channels(self, guild_id: int, group_name: Optional[str] = None) -> List[int]:
+        """Removes all channels for a guild (or a specific group in that guild) and returns their IDs."""
         assert self._conn is not None
-        async with self._conn.execute("SELECT channel_id, language_code, is_romanized FROM group_channels;") as cursor:
+        if group_name:
+            effective_group = self.scoped_group_id(guild_id, group_name)
+            select_sql = "SELECT channel_id FROM group_channels WHERE guild_id = ? AND group_id = ?;"
+            select_params: Tuple[Any, ...] = (guild_id, effective_group)
+        else:
+            select_sql = "SELECT channel_id FROM group_channels WHERE guild_id = ?;"
+            select_params = (guild_id,)
+
+        async with self._conn.execute(select_sql, select_params) as cursor:
+            removed_ids = [row[0] for row in await cursor.fetchall()]
+
+        if not removed_ids:
+            return []
+
+        if group_name:
+            await self._conn.execute(
+                "DELETE FROM group_channels WHERE guild_id = ? AND group_id = ?;",
+                (guild_id, effective_group)
+            )
+            await self._conn.execute(
+                "DELETE FROM translation_groups WHERE group_id = ? AND guild_id = ?;",
+                (effective_group, guild_id)
+            )
+        else:
+            await self._conn.execute("DELETE FROM group_channels WHERE guild_id = ?;", (guild_id,))
+            await self._conn.execute("DELETE FROM translation_groups WHERE guild_id = ?;", (guild_id,))
+
+        await self._conn.commit()
+        return removed_ids
+
+    async def get_active_channels(self, guild_id: Optional[int] = None) -> Dict[int, Dict[str, Any]]:
+        """Returns configured channel IDs, languages, romanized flags, and guild/group scope."""
+        assert self._conn is not None
+        if guild_id is not None:
+            sql = "SELECT channel_id, language_code, is_romanized, guild_id, group_id FROM group_channels WHERE guild_id = ?;"
+            params: Tuple[Any, ...] = (guild_id,)
+        else:
+            sql = "SELECT channel_id, language_code, is_romanized, guild_id, group_id FROM group_channels;"
+            params = ()
+
+        async with self._conn.execute(sql, params) as cursor:
             rows = await cursor.fetchall()
             return {
                 row[0]: {
                     "lang": row[1],
-                    "is_romanized": bool(row[2])
+                    "is_romanized": bool(row[2]),
+                    "guild_id": row[3] or 0,
+                    "group_id": row[4] or "default",
                 }
                 for row in rows
             }
@@ -220,14 +340,27 @@ class DatabaseManager:
             row = await cursor.fetchone()
             return row[0] if row else None
 
-    async def get_stats(self) -> Dict[str, int]:
-        """Returns statistics for observability and monitoring dashboard."""
+    async def get_stats(self, guild_id: Optional[int] = None) -> Dict[str, int]:
+        """Returns statistics for observability and monitoring dashboard (scoped by guild if given)."""
         assert self._conn is not None
-        async with self._conn.execute("SELECT COUNT(DISTINCT conversation_uuid) FROM message_sync;") as c1:
-            total_conversations = (await c1.fetchone())[0]
+        if guild_id is not None:
+            async with self._conn.execute("""
+                SELECT COUNT(DISTINCT conversation_uuid) FROM message_sync
+                WHERE source_channel_id IN (SELECT channel_id FROM group_channels WHERE guild_id = ?);
+            """, (guild_id,)) as c1:
+                total_conversations = (await c1.fetchone())[0]
 
-        async with self._conn.execute("SELECT COUNT(*) FROM group_channels;") as c2:
-            total_channels = (await c2.fetchone())[0]
+            async with self._conn.execute(
+                "SELECT COUNT(*) FROM group_channels WHERE guild_id = ?;",
+                (guild_id,)
+            ) as c2:
+                total_channels = (await c2.fetchone())[0]
+        else:
+            async with self._conn.execute("SELECT COUNT(DISTINCT conversation_uuid) FROM message_sync;") as c1:
+                total_conversations = (await c1.fetchone())[0]
+
+            async with self._conn.execute("SELECT COUNT(*) FROM group_channels;") as c2:
+                total_channels = (await c2.fetchone())[0]
 
         return {
             "total_synced_messages": total_conversations,
@@ -258,8 +391,8 @@ class DatabaseManager:
 
         # Bounded fuzzy scan of the 100 most recent translations for this language pair
         import difflib
-        from translator import extract_negation_words
-        query_negs = extract_negation_words(clean_text)
+        from translator import extract_fuzzy_guards
+        query_guards = extract_fuzzy_guards(clean_text)
         len_margin = max(3, int(len(clean_text) * 0.25))
 
         async with self._conn.execute("""
@@ -270,7 +403,7 @@ class DatabaseManager:
             rows = await cursor.fetchall()
             for cached_source, cached_trans in rows:
                 if abs(len(cached_source) - len(clean_text)) <= len_margin:
-                    if extract_negation_words(cached_source) == query_negs:
+                    if extract_fuzzy_guards(cached_source) == query_guards:
                         ratio = difflib.SequenceMatcher(None, clean_text, cached_source).ratio()
                         if ratio >= 0.90:
                             # Auto-backfill for future instant O(1) hits

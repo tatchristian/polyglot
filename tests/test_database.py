@@ -201,3 +201,68 @@ async def test_chunked_messages_preserve_all_relayed_ids():
     assert (202, 9002) in deleted
 
     await db.close()
+
+@pytest.mark.asyncio
+async def test_guild_and_group_isolation_in_db():
+    """Verifies that servers and groups are strictly isolated during adds, removals, resets, and stats."""
+    db = DatabaseManager(db_path=":memory:")
+    await db.connect()
+
+    # Add channels for Guild 1 (KachiX) and Guild 2 (UDA) with the same group name 'default'
+    await db.add_channel(1001, "en", guild_id=111, group_id="default")
+    await db.add_channel(1002, "es", guild_id=111, group_id="default")
+    await db.add_channel(1003, "en", guild_id=111, group_id="staff")
+    await db.add_channel(2001, "en", guild_id=222, group_id="default")
+    await db.add_channel(2002, "hi", is_romanized=True, guild_id=222, group_id="default")
+
+    g1_channels = await db.get_active_channels(guild_id=111)
+    g2_channels = await db.get_active_channels(guild_id=222)
+    assert set(g1_channels.keys()) == {1001, 1002, 1003}
+    assert set(g2_channels.keys()) == {2001, 2002}
+    assert g1_channels[1001]["group_id"] == "111:default"
+    assert g1_channels[1003]["group_id"] == "111:staff"
+    assert g2_channels[2001]["group_id"] == "222:default"
+
+    # Attempt to remove Guild 1's channel using Guild 2's ID must fail (no cross-guild deletion)
+    assert await db.remove_channel(1001, guild_id=222) is False
+    assert 1001 in await db.get_active_channels(guild_id=111)
+
+    # Record synced message in Guild 1 only
+    await db.record_relayed_messages("uuid-g1", 1001, 500, [(1002, 501)])
+    assert (await db.get_stats(guild_id=111))["total_synced_messages"] == 1
+    assert (await db.get_stats(guild_id=222))["total_synced_messages"] == 0
+
+    # Resetting Guild 2 must NOT touch Guild 1
+    removed_g2 = await db.remove_guild_channels(guild_id=222)
+    assert set(removed_g2) == {2001, 2002}
+    assert await db.get_active_channels(guild_id=222) == {}
+    assert set((await db.get_active_channels(guild_id=111)).keys()) == {1001, 1002, 1003}
+
+    await db.close()
+
+@pytest.mark.asyncio
+async def test_migrate_legacy_channel_guild():
+    """Verifies legacy guild_id=0 rows migrate cleanly to scoped guild groups."""
+    db = DatabaseManager(db_path=":memory:")
+    await db.connect()
+
+    await db.add_channel(9001, "en")  # Legacy defaults: guild_id=0, group_id='default'
+    await db.migrate_channel_guild(9001, guild_id=777)
+
+    active = await db.get_active_channels(guild_id=777)
+    assert 9001 in active
+    assert active[9001]["guild_id"] == 777
+    assert active[9001]["group_id"] == "777:default"
+
+    await db.close()
+
+@pytest.mark.asyncio
+async def test_connect_is_idempotent_on_reconnect():
+    """Calling connect() repeatedly after Discord reconnects must reuse the existing connection."""
+    db = DatabaseManager(db_path=":memory:")
+    await db.connect()
+    first_conn = db._conn
+    await db.connect()
+    assert db._conn is first_conn
+    await db.close()
+    assert db._conn is None
